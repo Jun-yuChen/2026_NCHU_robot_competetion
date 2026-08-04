@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,6 +29,8 @@ setup(
             'joy = py_gripper.joy:main',
             'arm_feedback_states = py_gripper.arm_feedback_states:main',
             'arm_cmd_port = py_gripper.arm_cmd_port:main',
+            'arm_move_node = py_gripper.arm_move_node:main',
+            'arm_pos_test = py_gripper.arm_pos_test:main',
         ],
     },
 )

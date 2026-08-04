@@ -16,5 +16,12 @@ def generate_launch_description():
             name='wrist_camera_node',
             output='screen',
             parameters=[params_file],
-        )
+        ),
+
+        Node(
+                package='port_pose_estimator',
+                executable='yolo_detector_node',
+                name='yolo_detector_node',
+                parameters=[params_file],
+        ),
     ])

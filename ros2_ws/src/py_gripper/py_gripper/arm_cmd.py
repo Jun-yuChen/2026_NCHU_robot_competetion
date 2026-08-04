@@ -16,8 +16,8 @@ import time
 # place
 
 class ArmCmd(Node):
-    def __init__(self):
-        super().__init__('arm_cmd')
+    def __init__(self, node_name='arm_cmd'):
+        super().__init__(node_name)
         self.pos_cli = self.create_client(SetPositions, 'set_positions')
         self.event_cli = self.create_client(SetEvent, 'set_event')
         self.io_cli = self.create_client(SetIO, '/set_io')
@@ -106,9 +106,9 @@ def main(args=None):
             
         response = armCmd.set_position(positions)
 
-        # status = armCmd.wait_until_arrived()
-        # if status != True:
-        #     print("timeout for reach target")
+        status = armCmd.wait_until_arrived()
+        if status != True:
+            print("timeout for reach target")
 
         armCmd.get_logger().info("Response: %s" % response)
 

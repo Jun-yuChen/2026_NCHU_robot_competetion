@@ -1,6 +1,6 @@
 wrist_camera_node:
   ros__parameters:
-    serial: "323622271472"
+    serial: "260322273823"
     width: 848
     height: 480
     fps: 30

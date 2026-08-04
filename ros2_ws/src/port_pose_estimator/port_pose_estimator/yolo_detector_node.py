@@ -41,7 +41,7 @@ class YoloDetectorNode(Node):
     def __init__(self):
         super().__init__("yolo_detector_node")
 
-        self.declare_parameter('yolo_model_path', '/ros2_ws/src/port_pose_estimator/models/0719_yolo.pt')
+        self.declare_parameter('yolo_model_path', '/path/to/0719_yolo.pt')
         yolo_model_path = self.get_parameter('yolo_model_path').value
 
         # Set to False (e.g. via a launch param later) to run headless.

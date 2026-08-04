@@ -8,7 +8,7 @@ def generate_launch_description():
             package='tm_driver',
             executable='tm_driver',
             name='tm_driver_node',
-            arguments=['robot_ip:=192.168.10.3']
+            arguments=['robot_ip:=192.168.10.31']
         ),
         
         # Node(
