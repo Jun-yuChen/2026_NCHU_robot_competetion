@@ -65,6 +65,10 @@ class ArmCmd(Node):
         self.io_cli.call_async(res)
 
     def set_gripper(self, state=0):
+        """
+        state = 0.0 open the gripper
+        state = 1.0 close the gripper
+        """
         self.set_io(state=state)
 
     def send_event(self):

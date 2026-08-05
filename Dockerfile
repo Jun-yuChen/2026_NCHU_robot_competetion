@@ -7,6 +7,7 @@ ENV TZ=Asia/Taipei
 
 # Basic dependencies
 RUN apt-get update && apt-get install -y \
+    sudo \
     locales \
     tzdata \
     curl \
@@ -76,7 +77,11 @@ ARG UID=1000
 ARG GID=1000
 
 RUN groupadd -g ${GID} ${USERNAME} && \
-    useradd -m -u ${UID} -g ${GID} -s /bin/bash ${USERNAME}
+    useradd -m -u ${UID} -g ${GID} -s /bin/bash ${USERNAME} && \
+    groupadd -f -g 20 dialout && \
+    usermod -aG dialout,sudo ${USERNAME} && \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
+    chmod 0440 /etc/sudoers.d/${USERNAME}
 
 # Set up the ROS 2 workspace directory and permissions
 WORKDIR /ros2_ws

@@ -101,21 +101,20 @@ class ArmMoveNode(ArmCmd):
         # camera frame -> flange frame -> end-effector frame
         p_G = self.T_G_C @ p_C
         p_E = self.T_E_G @ p_G
-
-        self.get_logger().info(f"p_C: {p_C}")
-        self.get_logger().info(f"p_G: {p_G}")
-        self.get_logger().info(f"p_E: {p_E}")
  
         # offset along the end-effector's own z-axis (its approach direction)
         hover_point_E = p_E.copy()
         hover_point_E[2] -= self.hover_height
 
-        self.get_logger().info(f"hover_point_E: {hover_point_E[:3]}")
+        # self.get_logger().info(f"p_C: {p_C}")
+        # self.get_logger().info(f"p_G: {p_G}")
+        # self.get_logger().info(f"p_E: {p_E}")
+        # self.get_logger().info(f"hover_point_E: {hover_point_E[:3]}")
+        # self.get_logger().info(f"hover_point_G: {hover_point_G[:3]}")
+        # self.get_logger().info(f"T_B_G: \n{self.T_B_G}")
  
         # end-effector frame -> flange frame -> base frame (T_B_G is live, from feedback)
         hover_point_G = self.T_G_E @ hover_point_E
-        self.get_logger().info(f"hover_point_G: {hover_point_G[:3]}")
-        self.get_logger().info(f"T_B_G: \n{self.T_B_G}")
 
         hover_point_B = self.T_B_G @ hover_point_G
         return hover_point_B[:3]
@@ -142,21 +141,38 @@ class ArmMoveNode(ArmCmd):
         if key != 'a':
             print("Move cancelled.")
             return None
- 
-        return self.set_position(positions, velocity=velocity, acc_time=acc_time)
+
+        response = self.set_position(positions, velocity=velocity, acc_time=acc_time)
+         
+        return response
 
 
 
 def main(args=None):
+    import time
+
     rclpy.init(args=args)
     node = ArmMoveNode()
 
     try:
         while rclpy.ok():
+            # Move to observation position and open the gripper
+            node.set_position([0.5, 0.0, 0.30, 3.14159, 0.0, 3.14159])
+            node.set_gripper(0.0)
+            node.wait_until_arrived(error=0.01, timeout=30.0)
+
+            time.sleep(5)
+            node.set_gripper(1.0)
+
             input("Press Enter to move to highest-confidence detection (Ctrl+C to quit)...")
+
             response = node.move_to_best_detection()
+            node.wait_until_arrived(error=0.01, timeout=30.0)
+
+            time.sleep(3)
+
             node.get_logger().info("Response: %s" % response)
-            node.wait_until_arrived()
+
     except KeyboardInterrupt:
         pass
     finally:

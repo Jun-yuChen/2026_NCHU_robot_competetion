@@ -1,0 +1,27 @@
+# Ignore bash history
+bash_history
+.env
+.git
+
+# Ignore build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+
+# Ignore the contents of these repositories
+ros2_ws/src/realsense-ros/*
+ros2_ws/src/tm2_ros2/*
+
+# Keep these directories (but not their contents)
+!ros2_ws/src/realsense-ros/
+!ros2_ws/src/tm2_ros2/
+
+# Ignore everything inside those directories
+ros2_ws/src/realsense-ros/**
+ros2_ws/src/tm2_ros2/**
+
+# Keep a placeholder file so Git tracks the empty directories
+!ros2_ws/src/realsense-ros/.gitkeep
+!ros2_ws/src/tm2_ros2/.gitkeep
+

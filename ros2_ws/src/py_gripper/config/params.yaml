@@ -1,4 +1,4 @@
 arm_move_node:
   ros__parameters:
     robot_wrist_hand_eye_config_path: "/ros2_ws/src/py_gripper/calibration/ICA_Lab_UMI_Config_0804_1.yaml"
-    hover_height: 0.2
+    hover_height: 0.14
