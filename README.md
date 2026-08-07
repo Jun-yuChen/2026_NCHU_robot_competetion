@@ -142,6 +142,7 @@ colcon build --symlink-install
 | **custom_interface**    | Custom ROS 2 message and service definitions used by the project.                                          |
 | **port_pose_estimator** | Runs the RealSense camera, YOLO object detection, and estimates the 3D pose of the target port.            |
 | **py_gripper**          | Controls the Techman robot and gripper. Performs robot motion planning based on the estimated target pose. |
+| **optoforce_driver**    | Driver for OptoForce 6-axis FT sensor. Includes a ROS node for running the sensor.                         |
 | **tm2_ros2**            | Official ROS 2 driver for the Techman robot.                                                               |
 | **realsense-ros**       | Official ROS 2 wrapper for Intel RealSense cameras.                                                        |
 

@@ -36,6 +36,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Detection3DArray.msg"
   "msg/YoloDetectionFrame.msg"
 
+  "srv/PVTCommand.srv"
+
   DEPENDENCIES geometry_msgs 
   DEPENDENCIES sensor_msgs     # Add packages that above messages depend on.
 )

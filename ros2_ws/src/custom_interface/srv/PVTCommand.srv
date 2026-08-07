@@ -1,0 +1,35 @@
+# Request: one streamed PVT point, generator -> control.
+# A service (not a topic) so the generator's client naturally blocks on
+# discovery until the control node's server is up -- no more silently
+# dropped points from publishing before the subscriber has matched.
+std_msgs/Header header
+
+uint32 tick
+uint32 total_points
+bool is_last
+
+# Cartesian target, SI units / degrees
+float64 x_m
+float64 y_m
+float64 z_m
+float64 rx_deg
+float64 ry_deg
+float64 rz_deg
+
+# Velocity, computed online by the generator from position diff
+float64 vx_mps
+float64 vy_mps
+float64 vz_mps
+float64 wx_dps
+float64 wy_dps
+float64 wz_dps
+
+# Requested duration for this PVT segment (s)
+float64 point_time_s
+---
+# Response: control -> generator
+int32 ROBOT_OK=0
+int32 ROBOT_ERROR=1
+
+int32 result
+string message

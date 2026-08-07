@@ -7,6 +7,7 @@ bash_history
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+ros2_ws/pvt_out/
 
 
 # Ignore the contents of these repositories
