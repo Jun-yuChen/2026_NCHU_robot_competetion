@@ -53,12 +53,6 @@ git clone https://github.com/TechmanRobotInc/tm2_ros2.git
 git clone https://github.com/IntelRealSense/realsense-ros.git
 ```
 
-### OptoForce FT Sensor Driver
-```bash
-git clone https://github.com/keep5lience5555-crypto/optoforce.git
-```
-
-
 After cloning, the workspace should look like
 
 ```text
@@ -68,7 +62,8 @@ ros2_ws/src/
 ├── py_gripper
 ├── optoforce_driver
 ├── tm2_ros2
-└── realsense-ros
+├── realsense-ros
+└── ...
 ```
 
 ---
@@ -159,7 +154,7 @@ source /ros2_ws/install/setup.bash
 
 Run each component in a separate terminal.
 
-## 1. Launch the Techman robot
+## Launch the Techman robot
 
 ```bash
 ros2 launch py_gripper tmr_grip_launch.py
@@ -169,7 +164,7 @@ This starts the Techman robot driver and gripper interface.
 
 ---
 
-## 2. Launch the camera and perception pipeline
+## Launch the camera and perception pipeline
 
 ```bash
 ros2 launch port_pose_estimator wrist_camera_launch.py
@@ -183,7 +178,7 @@ This launches:
 
 ---
 
-## 3. Start the robot motion node
+## Start the robot motion node
 
 ```bash
 ros2 run py_gripper arm_move_node \
@@ -195,15 +190,35 @@ The motion node subscribes to the estimated target pose and commands the robot t
 
 ---
 
+## Start stream control (PVT control) node
+```bash
+ros2 launch stream_control stream_launch.py 
+```
+This node allows the robot to receive PVT command.
+
+## Start spiral searching and insertion node
+```bash
+ros2 launch stream_control spiral_search_launch.py 
+```
+This node will do surface touch, z-force control, spiral search and peg insert.
+
+---
+
 # Typical Workflow
 
 1. Build the Docker image.
 2. Start the Docker container.
 3. Build the ROS workspace.
 4. Launch the Techman robot.
-5. Launch the perception pipeline.
-6. Start the robot motion node.
-7. The robot detects the target and executes the insertion task.
+
+## Using Yolo to move the robot
+1. Launch the perception pipeline.
+2. Start the robot motion node.
+3. The robot detects the target and executes the insertion task.
+
+## Insertion with spiral searching
+1. Launch the stream control node.
+2. Launch the node for spiral searching with z-force controller.
 
 ---
 
