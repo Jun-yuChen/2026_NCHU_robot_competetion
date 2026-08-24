@@ -97,17 +97,32 @@ def main(args=None):
     rclpy.init(args=args)
     armCmd = ArmCmd()
 
-    gripper = 0
-    armCmd.set_gripper(gripper)
-
     while True:
         positions = list(map(float, input("Positions: ").split()))
-        if len(positions) == 3:
-            positions = positions + [3.14159, 0.0, 3.14]
 
         if len(positions) == 0:
             armCmd.send_event()
-            
+            continue
+
+        if len(positions) == 3:
+            gripper = None
+            positions = positions + [3.14159, 0.0, 3.14]
+
+        elif len(positions) == 4:
+            gripper = positions[3]
+            positions = positions[:3] + [3.14159, 0.0, 3.14]
+
+        elif len(positions) == 6:
+            gripper = None
+
+        elif len(positions) == 7:
+            gripper = positions[6]
+            positions = positions[:6]
+
+        else:
+            print("Please enter 0, 3, 4, 6, or 7 values.")
+            continue
+
         response = armCmd.set_position(positions)
 
         status = armCmd.wait_until_arrived()
@@ -116,12 +131,9 @@ def main(args=None):
 
         armCmd.get_logger().info("Response: %s" % response)
 
-        if gripper == 0:
-            gripper = 1
-        else:
-            gripper = 0
-
-        armCmd.set_gripper(gripper)
+        if gripper is not None:
+            armCmd.set_gripper(gripper)
+            
         print(f"Gripper state: {gripper}")
 
 

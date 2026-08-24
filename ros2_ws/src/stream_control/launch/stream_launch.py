@@ -6,23 +6,6 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='stream_control',
-            executable='trajectory_generator_node',
-            name='pvt_trajectory_generator',
-            output='screen',
-            parameters=[{
-                'ctrl_hz': 100.0,
-                'duration_s': 10.0,
-                'pvt_point_time_ratio': 0.9, # Don't touch this
-                'amp_m': 0.050,
-                'period_s': 5.0,
-                'phase_rad': 0.0,
-                'command_service': 'pvt_command',
-                'service_wait_log_period_s': 2.0,
-            }],
-        ),
-        
-        Node(
-            package='stream_control',
             executable='stream_control_node',
             name='pvt_stream_control',
             output='screen',
@@ -39,6 +22,7 @@ def generate_launch_description():
                 'output_dir': 'pvt_out',
                 'output_prefix': 'pvt_split',
                 'cmd_history_window_s': 2.0,
+                'stall_timeout_s': 2.0,
             }],
         ),
     ])

@@ -96,6 +96,11 @@ class StreamControlNode(Node):
         self.declare_parameter("output_dir", "pvt_out")
         self.declare_parameter("output_prefix", "pvt_split")
         self.declare_parameter("cmd_history_window_s", 2.0)
+        self.declare_parameter("translation_speed_limit_mps", 0.5)
+        self.declare_parameter("rotation_speed_limit_dps", 90.0)
+        self.declare_parameter("translation_step_limit_m", 0.01)
+        self.declare_parameter("rotation_step_limit_deg", 2.0)
+        self.declare_parameter("stall_timeout_s", 2.0)
 
         self.obs_hz = float(self.get_parameter("obs_hz").value)
         self.obs_log_period_s = float(self.get_parameter("obs_log_period_s").value)
@@ -108,6 +113,11 @@ class StreamControlNode(Node):
         self.output_dir = self.get_parameter("output_dir").value
         self.output_prefix = self.get_parameter("output_prefix").value
         self.cmd_history_window_s = float(self.get_parameter("cmd_history_window_s").value)
+        self.translation_speed_limit_mps = float(self.get_parameter("translation_speed_limit_mps").value)
+        self.rotation_speed_limit_dps = float(self.get_parameter("rotation_speed_limit_dps").value)
+        self.translation_step_limit_m = float(self.get_parameter("translation_step_limit_m").value)
+        self.rotation_step_limit_deg = float(self.get_parameter("rotation_step_limit_deg").value)
+        self.stall_timeout_s = float(self.get_parameter("stall_timeout_s").value)
 
         command_service = self.get_parameter("command_service").value
 
@@ -126,6 +136,7 @@ class StreamControlNode(Node):
         self.stream_start_wall: Optional[float] = None
         self.stream_end_wall: Optional[float] = None
         self.done = False
+        self._last_cmd_recv_wall: Optional[float] = None
 
         # ack tracking
         self._inflight = 0
@@ -137,6 +148,9 @@ class StreamControlNode(Node):
         self._cmd_history: deque = deque()  # (t_wall, ref_z)
         self._ref_z_latest: Optional[float] = None
 
+        # safety: previous (possibly-truncated) target pose, for step-limit checks
+        self._prev_target: Optional[Tuple[float, float, float, float, float, float]] = None
+
         # obs tracking
         self._meas_z_prev: Optional[float] = None
         self._meas_vz_lpf: float = 0.0
@@ -147,6 +161,7 @@ class StreamControlNode(Node):
         self.obs_log: List[ObsSample] = []
 
         self.obs_timer = self.create_timer(1.0 / self.obs_hz, self._obs_tick)
+        self.watchdog_timer = self.create_timer(0.5, self._watchdog_tick)
 
         self.get_logger().info("Robot control node init, waiting for send_script...")
         if not self.send_script.wait_for_service(timeout_sec=10.0):
@@ -185,6 +200,7 @@ class StreamControlNode(Node):
             return response
 
         recv_wall = time.time()
+        self._last_cmd_recv_wall = recv_wall
 
         if not self.entered_pvt:
             self.entered_pvt = True
@@ -199,17 +215,64 @@ class StreamControlNode(Node):
         stamp_s = request.header.stamp.sec + request.header.stamp.nanosec * 1e-9
         jitter_s = (recv_wall - stamp_s) if stamp_s > 0 else 0.0
 
+        # ---------- safety checks: truncate, never pass raw values through ----------
+        # 1) per-axis speed limit -- each of vx/vy/vz/wx/wy/wz is clamped to
+        #    its own +-limit, NOT the vector norm.
+        vx, vx_over = self._clamp_magnitude(request.vx_mps, self.translation_speed_limit_mps)
+        vy, vy_over = self._clamp_magnitude(request.vy_mps, self.translation_speed_limit_mps)
+        vz, vz_over = self._clamp_magnitude(request.vz_mps, self.translation_speed_limit_mps)
+        wx, wx_over = self._clamp_magnitude(request.wx_dps, self.rotation_speed_limit_dps)
+        wy, wy_over = self._clamp_magnitude(request.wy_dps, self.rotation_speed_limit_dps)
+        wz, wz_over = self._clamp_magnitude(request.wz_dps, self.rotation_speed_limit_dps)
+
+        # 2) per-axis step limit -- how far this target may move from the
+        #    PREVIOUS command's (already-truncated) target on each axis.
+        #    No previous target yet -> nothing to compare against, skip.
+        #    Translation axes use plain delta; rotation axes use the
+        #    shortest signed angular delta so a target that legitimately
+        #    crosses +-180 deg isn't misread as a huge jump.
+        pt = self._prev_target
+        x, x_over = self._clamp_step(request.x_m, pt[0] if pt else None, self.translation_step_limit_m)
+        y, y_over = self._clamp_step(request.y_m, pt[1] if pt else None, self.translation_step_limit_m)
+        z, z_over = self._clamp_step(request.z_m, pt[2] if pt else None, self.translation_step_limit_m)
+        rx, rx_over = self._clamp_step_angular(request.rx_deg, pt[3] if pt else None, self.rotation_step_limit_deg)
+        ry, ry_over = self._clamp_step_angular(request.ry_deg, pt[4] if pt else None, self.rotation_step_limit_deg)
+        rz, rz_over = self._clamp_step_angular(request.rz_deg, pt[5] if pt else None, self.rotation_step_limit_deg)
+        self._prev_target = (x, y, z, rx, ry, rz)
+
+        violations: List[str] = []
+        if vx_over: violations.append(f"vx {request.vx_mps:+.4f}->{vx:+.4f} m/s")
+        if vy_over: violations.append(f"vy {request.vy_mps:+.4f}->{vy:+.4f} m/s")
+        if vz_over: violations.append(f"vz {request.vz_mps:+.4f}->{vz:+.4f} m/s")
+        if wx_over: violations.append(f"wx {request.wx_dps:+.3f}->{wx:+.3f} dps")
+        if wy_over: violations.append(f"wy {request.wy_dps:+.3f}->{wy:+.3f} dps")
+        if wz_over: violations.append(f"wz {request.wz_dps:+.3f}->{wz:+.3f} dps")
+        if x_over: violations.append(f"x-step {request.x_m:+.4f}->{x:+.4f} m")
+        if y_over: violations.append(f"y-step {request.y_m:+.4f}->{y:+.4f} m")
+        if z_over: violations.append(f"z-step {request.z_m:+.4f}->{z:+.4f} m")
+        if rx_over: violations.append(f"rx-step {request.rx_deg:+.3f}->{rx:+.3f} deg")
+        if ry_over: violations.append(f"ry-step {request.ry_deg:+.3f}->{ry:+.3f} deg")
+        if rz_over: violations.append(f"rz-step {request.rz_deg:+.3f}->{rz:+.3f} deg")
+
+        limit_exceeded = len(violations) > 0
+        if limit_exceeded:
+            self.get_logger().warn(
+                f"[CTRL {request.tick:03d}] SAFETY LIMIT exceeded, truncating -> "
+                + "; ".join(violations)
+            )
+        # ---------- end safety checks ----------
+
         cmd_script = self._pvt_point_cmd(
-            request.x_m, request.y_m, request.z_m,
-            request.rx_deg, request.ry_deg, request.rz_deg,
-            request.vx_mps, request.vy_mps, request.vz_mps,
-            request.wx_dps, request.wy_dps, request.wz_dps,
+            x, y, z,
+            rx, ry, rz,
+            vx, vy, vz,
+            wx, wy, wz,
             request.point_time_s,
         )
         self._send_async(f"P{request.tick % 90 + 10:03d}", cmd_script)
 
-        self._ref_z_latest = request.z_m
-        self._cmd_history.append((recv_wall, request.z_m))
+        self._ref_z_latest = z
+        self._cmd_history.append((recv_wall, z))
         cutoff = recv_wall - self.cmd_history_window_s
         while self._cmd_history and self._cmd_history[0][0] < cutoff:
             self._cmd_history.popleft()
@@ -232,8 +295,8 @@ class StreamControlNode(Node):
             CtrlSample(
                 t_wall=recv_wall,
                 tick=request.tick,
-                ref_z=request.z_m,
-                ref_vz=request.vz_mps,
+                ref_z=z,
+                ref_vz=vz,
                 jitter_s=jitter_s,
                 inflight=self._inflight,
                 ack_p50_ms=p50,
@@ -247,7 +310,7 @@ class StreamControlNode(Node):
             self.get_logger().info(
                 f"[CTRL {request.tick:03d}] jitter={jitter_s*1000:+.1f}ms "
                 f"inflight={self._inflight} ack_last={self._ack_last_ms:.1f}ms "
-                f"ref_z={request.z_m:.4f} ref_vz={request.vz_mps:+.3f}"
+                f"ref_z={z:.4f} ref_vz={vz:+.3f}"
             )
 
         if request.is_last:
@@ -256,11 +319,60 @@ class StreamControlNode(Node):
             self._send_async("E005", "PVTExit()")
             self.get_logger().info("=== CTRL STREAM END (PVTExit sent) ===")
 
-        response.result = PVTCommand.Response.ROBOT_OK
-        response.message = ""
+        if limit_exceeded:
+            response.result = PVTCommand.Response.ROBOT_ERROR
+            response.message = "safety limit exceeded: " + "; ".join(violations)
+        else:
+            response.result = PVTCommand.Response.ROBOT_OK
+            response.message = ""
         return response
 
     # ---------- helpers ----------
+    @staticmethod
+    def _clamp_magnitude(value: float, limit: float) -> Tuple[float, bool]:
+        """Truncate a signed value to +-limit (per-axis, not vector norm).
+        limit <= 0 disables the check. Returns (value, was_clamped)."""
+        if limit <= 0:
+            return value, False
+        if abs(value) > limit:
+            return math.copysign(limit, value), True
+        return value, False
+
+    @staticmethod
+    def _angle_diff_deg(curr: float, prev: float) -> float:
+        """Shortest signed delta curr-prev, wrapped to (-180, 180]."""
+        return (curr - prev + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _clamp_step(curr: float, prev: Optional[float], limit: float) -> Tuple[float, bool]:
+        """Truncate curr so |curr - prev| <= limit on this axis (plain
+        subtraction -- use for translation axes, which don't wrap).
+        limit <= 0 or prev is None (no previous command yet) disables the
+        check. Returns (value, was_clamped)."""
+        if limit <= 0 or prev is None:
+            return curr, False
+        delta = curr - prev
+        if abs(delta) > limit:
+            return prev + math.copysign(limit, delta), True
+        return curr, False
+
+    @classmethod
+    def _clamp_step_angular(cls, curr: float, prev: Optional[float], limit: float) -> Tuple[float, bool]:
+        """Truncate curr so the SHORTEST-PATH delta from prev is within
+        +-limit degrees. Wrap-safe: a target crossing +-180 deg is measured
+        by its true angular distance, not a raw subtraction, so it isn't
+        misread as a huge jump. Use for rx/ry/rz. limit <= 0 or prev is
+        None disables the check. Returns (value, was_clamped)."""
+        if limit <= 0 or prev is None:
+            return curr, False
+        delta = cls._angle_diff_deg(curr, prev)
+        if abs(delta) > limit:
+            clamped_delta = math.copysign(limit, delta)
+            new_val = prev + clamped_delta
+            new_val = ((new_val + 180.0) % 360.0) - 180.0  # normalize back to (-180,180]
+            return new_val, True
+        return curr, False
+
     def _send_async(self, sid: str, script: str):
         """SendScript async with ack latency tracking."""
         req = SendScript.Request()
@@ -387,6 +499,28 @@ class StreamControlNode(Node):
                         self._finalize("settled")
                         return
 
+    def _watchdog_tick(self):
+        """If we're mid-stream but haven't heard a PVTCommand in over
+        stall_timeout_s, the generator is presumed dead/stalled: send
+        PVTExit, finalize (saving CSV/PNG), and reset stream state so a
+        fresh generator run starts clean instead of inheriting stale
+        entered_pvt / _prev_target."""
+        if not self.streaming or self.done or self._last_cmd_recv_wall is None:
+            return
+
+        gap_s = time.time() - self._last_cmd_recv_wall
+        if gap_s > self.stall_timeout_s:
+            self.get_logger().warn(
+                f"Watchdog: no PVTCommand received for {gap_s:.2f}s "
+                f"(stall_timeout_s={self.stall_timeout_s:.2f}) -> aborting stream"
+            )
+            self._send_async("E005", "PVTExit()")
+            self.streaming = False
+            self.stream_end_wall = time.time()
+            self._finalize("stream_stalled")
+            self.entered_pvt = False
+            self._prev_target = None
+
     # ---------- finalize / logging ----------
     def _finalize(self, reason: str):
         if self.done:
@@ -396,6 +530,11 @@ class StreamControlNode(Node):
         if self.obs_timer is not None:
             try:
                 self.obs_timer.cancel()
+            except Exception:
+                pass
+        if self.watchdog_timer is not None:
+            try:
+                self.watchdog_timer.cancel()
             except Exception:
                 pass
 

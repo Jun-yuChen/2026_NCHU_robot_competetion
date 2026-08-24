@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Trajectory generator node for TM PVT streaming control.
-
-Responsibilities
------------------
-- Wait for one FeedbackState message to capture the starting tool pose.
-- Pre-generate the complete Z trajectory (all positions) from a
-  ZTrajectoryProvider (e.g. SineZTrajectory), exactly like the original
-  pvt_sine_wave_online.py.
-- Stream the trajectory one point at a time, at ctrl_hz, as PVTCommand
-  *service* calls to the robot control node. Velocity is still computed
-  online from the position difference between the current and previous
-  tick (v = (z_curr - z_prev) / dt) -- this node "only knows current &
-  previous point" the same way the original single-node version did.
+Z-axis force control node node for TM PVT streaming control.
 
 PVTCommand is a service rather than a topic specifically so this node
 cannot start dispatching points before the control node is actually up:
@@ -34,72 +22,39 @@ from typing import List, Optional
 import rclpy
 from rclpy.node import Node
 
+from stream_control.PI_controller import PI_controller
+
+from geometry_msgs.msg import WrenchStamped
 from tm_msgs.msg import FeedbackState
 from custom_interface.srv import PVTCommand
 
-
-# ---------------------------------------------------------------------------
-# Trajectory providers (same interface/logic as pvt_sine_wave_online.py)
-# ---------------------------------------------------------------------------
-class ZTrajectoryProvider:
-    """Interface for reusable Z-axis stream trajectories."""
-    name = "z_trajectory"
-
-    def build(self, start_pose_6d: List[float], ctrl_dt: float, total_points: int) -> List[float]:
-        raise NotImplementedError
-
-
-@dataclass
-class SineZTrajectory(ZTrajectoryProvider):
-    """Default sine trajectory used by the original online script."""
-    amp_m: float = 0.05
-    period_s: float = 2.0
-    phase_rad: float = 0.0
-    name: str = "sine_z"
-
-    def build(self, start_pose_6d: List[float], ctrl_dt: float, total_points: int) -> List[float]:
-        omega = 2.0 * math.pi / self.period_s
-        z0 = start_pose_6d[2]
-        return [
-            z0 + self.amp_m * math.sin(omega * k * ctrl_dt + self.phase_rad)
-            for k in range(total_points)
-        ]
-
-
-@dataclass
-class ListZTrajectory(ZTrajectoryProvider):
-    """Trajectory provider for a user-supplied list of relative or absolute Z points."""
-    z_points_m: List[float]
-    relative_to_start: bool = True
-    name: str = "list_z"
-
-    def build(self, start_pose_6d: List[float], ctrl_dt: float, total_points: int) -> List[float]:
-        if not self.z_points_m:
-            raise ValueError("z_points_m must contain at least one point")
-        z0 = start_pose_6d[2] if self.relative_to_start else 0.0
-        out = [z0 + z for z in self.z_points_m[:total_points]]
-        if len(out) < total_points:
-            out.extend([out[-1]] * (total_points - len(out)))
-        return out
-
-
-class TrajectoryGeneratorNode(Node):
+class ZForceControllerNode(Node):
     def __init__(self):
-        super().__init__("pvt_trajectory_generator")
+        super().__init__("z_force_controller")
+
+        self.fz_desire = 1  # 1N
 
         # ----- parameters -----
+        self.declare_parameter("PI_controller_Kp", 2e-4)
+        self.declare_parameter("PI_controller_Ki", 1e-4)
+        self.declare_parameter("PI_controller_integral_limit", 0.05)
+        
         self.declare_parameter("ctrl_hz", 100.0)
-        self.declare_parameter("duration_s", 6.0)
-        self.declare_parameter("pvt_point_time_ratio", 0.9)
-        self.declare_parameter("amp_m", 0.05)
-        self.declare_parameter("period_s", 2.0)
-        self.declare_parameter("phase_rad", 0.0)
+        self.declare_parameter("duration_s", 10.0)
+        self.declare_parameter("pvt_point_time_ratio", 0.9)  # Don't touch this
         self.declare_parameter("command_service", "pvt_command")
         self.declare_parameter("service_wait_log_period_s", 2.0)
+
+        self.force_controller = PI_controller(
+            Kp = self.get_parameter("PI_controller_Kp").value ,
+            Ki = self.get_parameter("PI_controller_Ki").value ,
+            integral_limit = self.get_parameter("PI_controller_integral_limit").value ,
+        )
 
         self.ctrl_hz = float(self.get_parameter("ctrl_hz").value)
         self.duration_s = float(self.get_parameter("duration_s").value)
         self.pvt_point_time_ratio = float(self.get_parameter("pvt_point_time_ratio").value)
+
         if self.ctrl_hz <= 0.0:
             raise ValueError("ctrl_hz must be > 0")
         if self.duration_s <= 0.0:
@@ -110,22 +65,20 @@ class TrajectoryGeneratorNode(Node):
         self.ctrl_dt = 1.0 / self.ctrl_hz
         self.total_points = int(round(self.duration_s * self.ctrl_hz))
 
-        # Swap this out (or make it a plugin param) for ListZTrajectory etc.
-        self.trajectory: ZTrajectoryProvider = SineZTrajectory(
-            amp_m=float(self.get_parameter("amp_m").value),
-            period_s=float(self.get_parameter("period_s").value),
-            phase_rad=float(self.get_parameter("phase_rad").value),
-        )
-
         command_service = self.get_parameter("command_service").value
         self.service_wait_log_period_s = float(self.get_parameter("service_wait_log_period_s").value)
         self.cmd_client = self.create_client(PVTCommand, command_service)
-        self.create_subscription(FeedbackState, "feedback_states", self._fb_cb, 10)
 
-        self.has_feedback = False
-        self.start_pose_6d: Optional[List[float]] = None
-        self.trajectory_z: Optional[List[float]] = None
-        self.z_prev: Optional[float] = None
+        self.create_subscription(FeedbackState, "feedback_states", self._fb_cb, 10)
+        self.create_subscription(WrenchStamped, 'optoforce/wrench', self._FTsensor_cb, 10)
+
+        self.feedback_is_avaliable = False
+        self.current_pose_6d: Optional[List[float]] = None
+
+        self.FT_is_avaliable = False
+        self.force_observe = None
+        self.torque_observe = None
+
         self.tick = 0
         self.done = False
 
@@ -136,18 +89,17 @@ class TrajectoryGeneratorNode(Node):
         self.startup_timer = self.create_timer(0.05, self._startup_tick)
         self.ctrl_timer = None
 
+        self.prev_time = None  # For control loop
+
         self.get_logger().info(
-            f"Trajectory generator init: {self.trajectory.name}, "
             f"{self.ctrl_hz:.1f}Hz, {self.total_points} points, "
             f"calling PVTCommand service '{command_service}'"
         )
 
     # ---------- ROS callbacks ----------
     def _fb_cb(self, msg: FeedbackState):
-        if self.has_feedback:
-            return  # only need the very first pose to anchor the trajectory
         if msg.tool_pose and len(msg.tool_pose) >= 6:
-            self.start_pose_6d = [
+            self.current_pose_6d = [
                 float(msg.tool_pose[0]),
                 float(msg.tool_pose[1]),
                 float(msg.tool_pose[2]),
@@ -155,11 +107,18 @@ class TrajectoryGeneratorNode(Node):
                 math.degrees(float(msg.tool_pose[4])),
                 math.degrees(float(msg.tool_pose[5])),
             ]
-            self.has_feedback = True
-            self.get_logger().info(f"✓ start pose captured: Z={self.start_pose_6d[2]:.4f}")
+            self.feedback_is_avaliable = True
+            # self.get_logger().info(f"Pose captured: Z={self.current_pose_6d[2]:.4f}")
+
+    def _FTsensor_cb(self, msg: WrenchStamped):
+        self.force_observe = msg.wrench.force
+        self.torque_observe = msg.wrench.torque
+
+        self.FT_is_avaliable = True
+        # self.get_logger().info(f"Force-Torque capture")
 
     def _startup_tick(self):
-        if not self.has_feedback or self.start_pose_6d is None:
+        if (not self.feedback_is_avaliable) or (self.current_pose_6d is None) or (not self.FT_is_avaliable):
             return
 
         if not self.cmd_client.service_is_ready():
@@ -173,45 +132,51 @@ class TrajectoryGeneratorNode(Node):
 
         self.startup_timer.cancel()
 
-        self.trajectory_z = self.trajectory.build(
-            self.start_pose_6d, self.ctrl_dt, self.total_points
-        )
-        self.get_logger().info(f"✓ pre-generated {len(self.trajectory_z)} trajectory points")
         self.get_logger().info("✓ PVTCommand service is up")
 
         self.ctrl_timer = self.create_timer(self.ctrl_dt, self._ctrl_tick)
-        self.get_logger().info("=== TRAJECTORY STREAM START ===")
 
     def _ctrl_tick(self):
-        if self.tick >= self.total_points:
-            if self.ctrl_timer:
-                self.ctrl_timer.cancel()
-            if not self.done:
-                self.done = True
-                self.get_logger().info("=== TRAJECTORY STREAM END ===")
+        if (not self.feedback_is_avaliable) or (not self.FT_is_avaliable):
+            return
+        
+        now = self.get_clock().now()
+
+        if self.prev_time is None:
+            self.prev_time = now
             return
 
-        z_current = self.trajectory_z[self.tick]
+        dt = (now - self.prev_time).nanoseconds * 1e-9
+        self.prev_time = now
 
-        # Velocity from position difference (not analytical formula) --
-        # this node only ever looks at "current & previous point".
-        if self.tick == 0:
-            vz = 0.0
-        else:
-            vz = (z_current - self.z_prev) / self.ctrl_dt
-        self.z_prev = z_current
+        # Guard against bad/zero dt
+        if dt <= 0.0:
+            return
+    
+        z_current = self.current_pose_6d[2]
+        error = self.fz_desire - self.force_observe.z
+
+        delta_z = self.force_controller.update(error, dt)
+
+        #self.get_logger().info(f"delta_z: {delta_z}")
+
+        # TODO: Check FT sensor corrdinate and robot coordinate
+        z_command = z_current - delta_z
+        vz = delta_z * self.ctrl_hz
+
+        self.get_logger().info(f"delta_z: {delta_z}    z_command: {z_command}")
 
         req = PVTCommand.Request()
         req.header.stamp = self.get_clock().now().to_msg()
         req.tick = self.tick
         req.is_last = (self.tick == self.total_points - 1)
 
-        req.x_m = self.start_pose_6d[0]
-        req.y_m = self.start_pose_6d[1]
-        req.z_m = z_current
-        req.rx_deg = self.start_pose_6d[3]
-        req.ry_deg = self.start_pose_6d[4]
-        req.rz_deg = self.start_pose_6d[5]
+        req.x_m = self.current_pose_6d[0]
+        req.y_m = self.current_pose_6d[1]
+        req.z_m = z_command
+        req.rx_deg = self.current_pose_6d[3]
+        req.ry_deg = self.current_pose_6d[4]
+        req.rz_deg = self.current_pose_6d[5]
 
         req.vx_mps = 0.0
         req.vy_mps = 0.0
@@ -222,9 +187,21 @@ class TrajectoryGeneratorNode(Node):
 
         req.point_time_s = self.ctrl_dt * self.pvt_point_time_ratio
 
+        # Safty check (Stop robot if force > 5N)
+        if self.force_observe.z > 10:          
+            req.z_m = self.current_pose_6d[2]
+            req.vz_mps = 0.0
+            self.get_logger().error(f"Z force > 10 N. Control end.")
+            self.ctrl_timer.cancel()
+            return
+
         this_tick = self.tick
         future = self.cmd_client.call_async(req)
         self._inflight += 1
+
+        if req.is_last:
+            self.get_logger().error(f"Duration end.")
+            self.ctrl_timer.cancel()
 
         def _done_cb(fut, tick=this_tick):
             self._inflight -= 1
@@ -252,7 +229,7 @@ class TrajectoryGeneratorNode(Node):
 
 def main():
     rclpy.init()
-    node = TrajectoryGeneratorNode()
+    node = ZForceControllerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

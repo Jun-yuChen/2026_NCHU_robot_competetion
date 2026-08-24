@@ -1,0 +1,81 @@
+insertion_node_rigid_search:
+  ros__parameters:
+    control_rate_hz: 100.0
+    command_interface: "pvt"
+
+    # Aligning/Inserting才會用到這組(Approaching/Searching是剛性軌跡，
+    # 不經過admittance_step)，數值沿用insertion_zero_params.yaml已經
+    # 實測調過的K/D。
+    admittance:
+      selected_axes: [true, true, true, false, false, false]
+      mass: [3.0, 3.0, 3.0, 1.0, 1.0, 1.0]
+      stiffness: [100.0, 100.0, 250.0, 1.0, 1.0, 1.0]
+      damping: [34.64, 34.64, 54.77, 2.0, 2.0, 2.0]
+
+    insertion:
+      insertion_depth: 0.13
+      insertion_speed: 0.005
+      completion_rate_threshold: 50.0
+      completion_min_travel_fraction: 0.5
+      early_contact_force_threshold: 8.0
+
+      contact_force_threshold: 0.6
+
+      # Searching的Z力控制參數(force_hold_z_velocity，不是導納F_desired)，
+      # 這幾個都還沒實機測過，第一次測試建議先用較保守的gain/max_speed，
+      # 觀察Z軸貼壓穩不穩再調大。
+      search_desired_force: 0.6
+      # 2026-08-21改成0.002(原本0.005)——實測貼合行為在0~-1.9N之間持續
+      # 震盪，調小降低震盪風險，先保守測試再視情況微調。
+      search_z_gain: 0.002
+      search_z_max_speed: 0.003
+
+      # Approaching→Searching切換瞬間的速度平滑過渡時間，避免瞬間速度
+      # 不連續造成頓挫。2026-08-21改成2.0秒(原本0.2秒)。
+      phase_transition_blend_sec: 2.0
+
+      search_pitch: 0.001
+      search_max_radius: 0.008
+      search_angular_speed: 2.0
+      # 2026-08-21：實測發現力量掉到接近0(死區前的濾波值)時沒有觸發，
+      # 懷疑是alpha=0.05濾波器把真實驟降磨平、算出來的變化率不到20N/s
+      # (跟insertion_node_zero.py調參時記錄過的同一個已知問題)。算過
+      # 濾波器對瞬間階躍的反應上限：Δ濾波值=alpha×ΔF，變化率=alpha×ΔF/dt。
+      # 這次觀察到的驟降約0.8N→0N，alpha=0.05、dt=0.01秒(100Hz)，算出來
+      # 理論上限只有0.05×0.8/0.01=4N/s，先改成10N/s還是太高，改成2N/s
+      # 留一點安全邊際。
+      # 2026-08-21改成5.0——2.0N/s換算成每拍(0.01秒)只要變化0.02N就觸發，
+      # 太敏感，Z力控制器本身動態調整就容易誤觸發，調高留一點餘裕。
+      # 2026-08-21再改成10.0。
+      found_hole_rate_threshold: 10.0
+      search_timeout_sec: 30.0
+      # 2026-08-21：實測1.2秒不夠，1.54秒時力量還在-0.98N→-0.53N明顯變動，
+      # 不是真正穩定狀態，導致驟降誤判。拉長到2.0秒。
+      search_settle_time_sec: 2.0
+
+      align_depth: 0.002
+      align_speed: 0.003
+      # 2026-08-21改成0.8——原本0.5N容易把插入過程中正常需要的接觸力
+      # 誤判成Step2的假陽性，放寬一點。
+      reject_force_threshold: 0.8
+
+    ft_sensor:
+      filter_coefficient: 0.05
+
+    sensor_frame:
+      r_g_s_flat: [0.976311621658206, -0.042412827226437404, 0.21217155676900715, 0.10397134817144844, -0.7680039766351463, -0.6319492468798537, 0.18975135355125988, 0.639039156827861, -0.7454014890421155]
+
+    safety:
+      deadband_force: [0.2, 0.2, 0.2, 0.1, 0.1, 0.1]
+      max_step_correction: 0.05
+      workspace_max_radius: 0.15
+      workspace_repulsion_gain: 50.0
+      force_limit: 30.0
+      torque_limit: 3.0
+      min_project_speed: 20
+
+    command:
+      set_positions_velocity: 0.25
+      set_positions_acc_time: 0.05
+      min_send_interval_sec: 0.2
+      pvt_point_time_sec: 0.007
