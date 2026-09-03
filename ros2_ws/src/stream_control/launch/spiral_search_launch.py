@@ -10,8 +10,6 @@ def generate_launch_description():
             name = 'spiral_search_controller',
             output='screen',
             parameters=[{
-                'robot_wrist_hand_eye_config_path': "./ros2_ws/src/py_gripper/calibration/ICA_Lab_UMI_Config_0901.yaml",
-
                 'PI_controller_Kp': 2e-4,
                 'PI_controller_Ki': 1e-4,
                 'PI_controller_integral_limit': 0.05,
@@ -22,9 +20,9 @@ def generate_launch_description():
                 'command_service': 'pvt_command',
                 'service_wait_log_period_s': 2.0,
 
-                'spiral_pitch_mm': 0.5,
+                'spiral_pitch_mm': 3.0,
                 'spiral_max_radius_mm': 50.0,
-                'spiral_search_speed_mm_s': 3.0,
+                'spiral_search_speed_mm_s': 20.0,
 
                 'touch_force_tol_n': 0.3,
                 'align_force': 0.3,

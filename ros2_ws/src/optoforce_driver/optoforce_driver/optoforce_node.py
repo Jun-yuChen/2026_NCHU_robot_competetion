@@ -51,7 +51,7 @@ class OptoForceNode(Node):
 
         self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('frame_id', 'optoforce_sensor')
-        self.declare_parameter('filter_window', 30)
+        self.declare_parameter('filter_window', 10)
         self.declare_parameter('offset_samples', 100)
         port = self.get_parameter('port').get_parameter_value().string_value
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value

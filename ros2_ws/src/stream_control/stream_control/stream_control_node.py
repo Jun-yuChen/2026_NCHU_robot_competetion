@@ -18,7 +18,7 @@ Responsibilities
   not be (e.g. send_script isn't available).
 - On the last request (is_last=True): forward the final point, then send
   PVTExit().
-- Independently, at obs_hz, read feedback_states to log measured Z / Vz,
+- Independently, at obs_hz, read feedback_states to log measured 6-DOF pose / velocity,
   instantaneous tracking error vs. the most recently received reference,
   and an estimated lag -- then auto-stop once motion settles (or times
   out), saving CSV + PNG, exactly like the original combined script.
@@ -57,8 +57,8 @@ from custom_interface.srv import PVTCommand
 class CtrlSample:
     t_wall: float
     tick: int
-    ref_z: float
-    ref_vz: float
+    ref_pose_6d: Tuple[float, float, float, float, float, float]
+    ref_vel_6d: Tuple[float, float, float, float, float, float]
     jitter_s: float
     inflight: int
     ack_p50_ms: float
@@ -70,10 +70,10 @@ class CtrlSample:
 @dataclass
 class ObsSample:
     t_wall: float
-    meas_z: float
-    meas_vz: float
-    ref_z_latest: float
-    inst_err_m: float
+    meas_pose_6d: Tuple[float, float, float, float, float, float]
+    ref_pose_6d: Tuple[float, float, float, float, float, float]
+    err_pose_6d: Tuple[float, float, float, float, float, float]
+    meas_vel_6d: Tuple[float, float, float, float, float, float]
     lag_est_s: float
     inflight: int
     ack_last_ms: float
@@ -96,11 +96,13 @@ class StreamControlNode(Node):
         self.declare_parameter("output_dir", "pvt_out")
         self.declare_parameter("output_prefix", "pvt_split")
         self.declare_parameter("cmd_history_window_s", 2.0)
-        self.declare_parameter("translation_speed_limit_mps", 0.5)
-        self.declare_parameter("rotation_speed_limit_dps", 90.0)
-        self.declare_parameter("translation_step_limit_m", 0.01)
+
+        # Safty limits
+        self.declare_parameter("translation_speed_limit_mps", 0.01)
+        self.declare_parameter("rotation_speed_limit_dps", 2.0)
+        self.declare_parameter("translation_step_limit_m", 0.01)  # distance between two adjacent PVT points.
         self.declare_parameter("rotation_step_limit_deg", 2.0)
-        self.declare_parameter("stall_timeout_s", 2.0)
+        self.declare_parameter("stall_timeout_s", 1.0)
 
         self.obs_hz = float(self.get_parameter("obs_hz").value)
         self.obs_log_period_s = float(self.get_parameter("obs_log_period_s").value)
@@ -145,8 +147,8 @@ class StreamControlNode(Node):
         self._overload_streak = 0
 
         # reference-command history, used for obs-loop comparison / lag estimate
-        self._cmd_history: deque = deque()  # (t_wall, ref_z)
-        self._ref_z_latest: Optional[float] = None
+        self._cmd_history: deque = deque()  # (t_wall, ref_pose_6d)
+        self._ref_pose_latest: Optional[Tuple[float, float, float, float, float, float]] = None
 
         # safety: previous (possibly-truncated) target pose, for step-limit checks
         self._prev_target: Optional[Tuple[float, float, float, float, float, float]] = None
@@ -271,8 +273,10 @@ class StreamControlNode(Node):
         )
         self._send_async(f"P{request.tick % 90 + 10:03d}", cmd_script)
 
-        self._ref_z_latest = z
-        self._cmd_history.append((recv_wall, z))
+        ref_pose_6d = (x, y, z, rx, ry, rz)
+        ref_vel_6d = (vx, vy, vz, wx, wy, wz)
+        self._ref_pose_latest = ref_pose_6d
+        self._cmd_history.append((recv_wall, ref_pose_6d))
         cutoff = recv_wall - self.cmd_history_window_s
         while self._cmd_history and self._cmd_history[0][0] < cutoff:
             self._cmd_history.popleft()
@@ -295,8 +299,8 @@ class StreamControlNode(Node):
             CtrlSample(
                 t_wall=recv_wall,
                 tick=request.tick,
-                ref_z=z,
-                ref_vz=vz,
+                ref_pose_6d=ref_pose_6d,
+                ref_vel_6d=ref_vel_6d,
                 jitter_s=jitter_s,
                 inflight=self._inflight,
                 ack_p50_ms=p50,
@@ -306,12 +310,15 @@ class StreamControlNode(Node):
             )
         )
 
+        '''
         if request.tick % 10 == 0:
             self.get_logger().info(
                 f"[CTRL {request.tick:03d}] jitter={jitter_s*1000:+.1f}ms "
                 f"inflight={self._inflight} ack_last={self._ack_last_ms:.1f}ms "
-                f"ref_z={z:.4f} ref_vz={vz:+.3f}"
+                f"ref_xyz=({x:.4f},{y:.4f},{z:.4f}) "
+                f"ref_rpy=({rx:.2f},{ry:.2f},{rz:.2f})"
             )
+        '''
 
         if request.is_last:
             self.streaming = False
@@ -417,24 +424,27 @@ class StreamControlNode(Node):
         mx = arr[-1]
         return p50, p95, mx
 
-    def _estimate_lag(self, meas_z: float) -> float:
-        """Find the recorded command whose ref_z is closest to meas_z within
-        the recent history window, and return how long ago it was received.
-        This is the discrete-stream equivalent of the original analytic
-        lag search -- this node has no trajectory formula to search over,
-        only the finite window of commands it has actually received."""
+    def _estimate_lag(self, meas_pose_6d: List[float]) -> float:
+        """Estimate lag from the recent 6-DOF command history."""
         if not self._cmd_history:
             return 0.0
+
         now = time.time()
         best_t, best_err = None, float("inf")
-        for t_wall, ref_z in self._cmd_history:
-            err = abs(meas_z - ref_z)
+        for t_wall, ref_pose in self._cmd_history:
+            pos_err = math.sqrt(sum(
+                (meas_pose_6d[i] - ref_pose[i]) ** 2 for i in range(3)
+            ))
+            rot_err = math.sqrt(sum(
+                self._angle_diff_deg(meas_pose_6d[i], ref_pose[i]) ** 2
+                for i in range(3, 6)
+            ))
+            err = pos_err + 0.001 * rot_err
             if err < best_err:
                 best_err = err
                 best_t = t_wall
-        if best_t is None:
-            return 0.0
-        return now - best_t
+
+        return 0.0 if best_t is None else now - best_t
 
     # ---------- observation loop ----------
     def _obs_tick(self):
@@ -442,47 +452,74 @@ class StreamControlNode(Node):
             return
 
         now = time.time()
-        meas_z = self.meas_pose_6d[2]
+        meas = list(self.meas_pose_6d)
 
-        if self._meas_z_prev is None:
-            vz = 0.0
+        if not hasattr(self, "_meas_pose_prev"):
+            self._meas_pose_prev: Optional[List[float]] = None
+            self._meas_vel_6d_lpf = [0.0] * 6
+
+        if self._meas_pose_prev is None:
+            meas_vel = [0.0] * 6
         else:
-            dt = 1.0 / self.obs_hz
-            vz = (meas_z - self._meas_z_prev) / max(1e-6, dt)
-        self._meas_z_prev = meas_z
-        self._meas_vz_lpf = (1.0 - self._vz_alpha) * self._meas_vz_lpf + self._vz_alpha * vz
+            dt = max(1e-6, 1.0 / self.obs_hz)
+            meas_vel = [
+                (meas[i] - self._meas_pose_prev[i]) / dt for i in range(6)
+            ]
+            for i in range(3, 6):
+                meas_vel[i] = self._angle_diff_deg(
+                    meas[i], self._meas_pose_prev[i]
+                ) / dt
 
-        if self._ref_z_latest is None:
-            ref_z_latest = meas_z
+        self._meas_pose_prev = meas
+        self._meas_vel_6d_lpf = [
+            (1.0 - self._vz_alpha) * self._meas_vel_6d_lpf[i]
+            + self._vz_alpha * meas_vel[i]
+            for i in range(6)
+        ]
+
+        if self._ref_pose_latest is None:
+            ref_pose = tuple(meas)
             lag_est = 0.0
         else:
-            ref_z_latest = self._ref_z_latest
-            lag_est = self._estimate_lag(meas_z)
+            ref_pose = self._ref_pose_latest
+            lag_est = self._estimate_lag(meas)
 
-        inst_err = meas_z - ref_z_latest
+        err_pose = (
+            meas[0] - ref_pose[0],
+            meas[1] - ref_pose[1],
+            meas[2] - ref_pose[2],
+            self._angle_diff_deg(meas[3], ref_pose[3]),
+            self._angle_diff_deg(meas[4], ref_pose[4]),
+            self._angle_diff_deg(meas[5], ref_pose[5]),
+        )
 
         self.obs_log.append(
             ObsSample(
                 t_wall=now,
-                meas_z=meas_z,
-                meas_vz=self._meas_vz_lpf,
-                ref_z_latest=ref_z_latest,
-                inst_err_m=inst_err,
+                meas_pose_6d=tuple(meas),
+                ref_pose_6d=tuple(ref_pose),
+                err_pose_6d=err_pose,
+                meas_vel_6d=tuple(self._meas_vel_6d_lpf),
                 lag_est_s=lag_est,
                 inflight=self._inflight,
                 ack_last_ms=self._ack_last_ms,
             )
         )
 
+        '''
         if (now - self._obs_last_log_wall) >= self.obs_log_period_s:
             self._obs_last_log_wall = now
             self.get_logger().info(
-                f"[OBS] z={meas_z:.4f} vz={self._meas_vz_lpf:+.3f} "
-                f"ref_z={ref_z_latest:.4f} err={inst_err*1000:+.1f}mm "
+                f"[OBS] xyz=({meas[0]:.4f},{meas[1]:.4f},{meas[2]:.4f}) "
+                f"rpy=({meas[3]:.2f},{meas[4]:.2f},{meas[5]:.2f}) "
+                f"err_xyz=({err_pose[0]*1000:+.1f},{err_pose[1]*1000:+.1f},"
+                f"{err_pose[2]*1000:+.1f})mm "
+                f"err_rpy=({err_pose[3]:+.2f},{err_pose[4]:+.2f},{err_pose[5]:+.2f})deg "
                 f"lag~{lag_est:+.2f}s inflight={self._inflight}"
             )
+        '''
 
-        # Auto-stop after stream end
+        # Keep the original settle criterion: Z velocity must remain small.
         if self.stream_end_wall is not None and not self.done:
             t_after = now - self.stream_end_wall
             if t_after > self.settle_timeout_s:
@@ -490,10 +527,13 @@ class StreamControlNode(Node):
                 self._finalize("settle_timeout")
                 return
 
-            if abs(self._meas_vz_lpf) < self.settle_vz_thr:
+            if abs(self._meas_vel_6d_lpf[2]) < self.settle_vz_thr:
                 N = int(max(1, round(self.settle_hold_s * self.obs_hz)))
                 if len(self.obs_log) >= N:
-                    ok = all(abs(s.meas_vz) < self.settle_vz_thr for s in self.obs_log[-N:])
+                    ok = all(
+                        abs(s.meas_vel_6d[2]) < self.settle_vz_thr
+                        for s in self.obs_log[-N:]
+                    )
                     if ok:
                         self.get_logger().info("Motion settled -> stop")
                         self._finalize("settled")
@@ -541,74 +581,137 @@ class StreamControlNode(Node):
         out_dir = self.output_dir
         os.makedirs(out_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
-        csv_path = os.path.join(out_dir, f"{self.output_prefix}_{ts}.csv")
+        obs_csv_path = os.path.join(out_dir, f"{self.output_prefix}_{ts}.csv")
+        control_csv_path = os.path.join(out_dir, f"{self.output_prefix}_control_{ts}.csv")
         png_path = os.path.join(out_dir, f"{self.output_prefix}_{ts}.png")
 
-        self._save_csv(csv_path)
+        # Observation/feedback CSV, plus a separate CSV containing every
+        # PVTCommand control sample that was received by this node.
+        self._save_obs_samples_csv(obs_csv_path)
+        self._save_control_samples_csv(control_csv_path)
         self._save_plot(png_path, reason)
 
-        self.get_logger().info(f"Saved: {csv_path}")
+        self.get_logger().info(f"Saved: {obs_csv_path}")
+        self.get_logger().info(f"Saved: {control_csv_path}")
         self.get_logger().info(f"Saved: {png_path}")
         self.get_logger().info(f"Reason: {reason}")
 
-    def _save_csv(self, path: str):
+    def _save_obs_samples_csv(self, path: str):
         t0 = self.stream_start_wall if self.stream_start_wall is not None else time.time()
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow([
                 "t_s",
-                "meas_z_m", "meas_vz_mps",
-                "ref_z_m", "inst_err_m",
-                "lag_est_s",
-                "inflight",
-                "ack_last_ms",
+                "meas_x_m", "meas_y_m", "meas_z_m",
+                "meas_rx_deg", "meas_ry_deg", "meas_rz_deg",
+                "ref_x_m", "ref_y_m", "ref_z_m",
+                "ref_rx_deg", "ref_ry_deg", "ref_rz_deg",
+                "err_x_m", "err_y_m", "err_z_m",
+                "err_rx_deg", "err_ry_deg", "err_rz_deg",
+                "meas_vx_mps", "meas_vy_mps", "meas_vz_mps",
+                "meas_wx_dps", "meas_wy_dps", "meas_wz_dps",
+                "lag_est_s", "inflight", "ack_last_ms",
             ])
+
             for s in self.obs_log:
+                mx, my, mz, mrx, mry, mrz = s.meas_pose_6d
+                rx, ry, rz, rrx, rry, rrz = s.ref_pose_6d
+                ex, ey, ez, erx, ery, erz = s.err_pose_6d
+                vx, vy, vz, wx, wy, wz = s.meas_vel_6d
+
                 w.writerow([
-                    f"{(s.t_wall - t0):.6f}",
-                    f"{s.meas_z:.6f}",
-                    f"{s.meas_vz:.6f}",
-                    f"{s.ref_z_latest:.6f}",
-                    f"{s.inst_err_m:.6f}",
+                    f"{s.t_wall - t0:.6f}",
+                    f"{mx:.6f}", f"{my:.6f}", f"{mz:.6f}",
+                    f"{mrx:.6f}", f"{mry:.6f}", f"{mrz:.6f}",
+                    f"{rx:.6f}", f"{ry:.6f}", f"{rz:.6f}",
+                    f"{rrx:.6f}", f"{rry:.6f}", f"{rrz:.6f}",
+                    f"{ex:.6f}", f"{ey:.6f}", f"{ez:.6f}",
+                    f"{erx:.6f}", f"{ery:.6f}", f"{erz:.6f}",
+                    f"{vx:.6f}", f"{vy:.6f}", f"{vz:.6f}",
+                    f"{wx:.6f}", f"{wy:.6f}", f"{wz:.6f}",
                     f"{s.lag_est_s:.3f}",
                     f"{s.inflight}",
                     f"{s.ack_last_ms:.3f}",
                 ])
 
+    def _save_control_samples_csv(self, path: str):
+        """Save the received control/PVTCommand samples to a separate CSV.
+
+        One row is written for every CtrlSample recorded during the stream.
+        This contains the commanded 6-DOF pose and velocity, plus command
+        timing/jitter and acknowledgement/backlog information.
+        """
+        t0 = self.stream_start_wall if self.stream_start_wall is not None else time.time()
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "t_s",
+                "tick",
+                "ref_x_m", "ref_y_m", "ref_z_m",
+                "ref_rx_deg", "ref_ry_deg", "ref_rz_deg",
+                "ref_vx_mps", "ref_vy_mps", "ref_vz_mps",
+                "ref_wx_dps", "ref_wy_dps", "ref_wz_dps",
+                "jitter_s",
+                "inflight",
+                "ack_p50_ms", "ack_p95_ms", "ack_max_ms",
+                "backlog_flag",
+            ])
+
+            for s in self.ctrl_log:
+                x, y, z, rx, ry, rz = s.ref_pose_6d
+                vx, vy, vz, wx, wy, wz = s.ref_vel_6d
+
+                w.writerow([
+                    f"{s.t_wall - t0:.6f}",
+                    f"{s.tick}",
+                    f"{x:.6f}", f"{y:.6f}", f"{z:.6f}",
+                    f"{rx:.6f}", f"{ry:.6f}", f"{rz:.6f}",
+                    f"{vx:.6f}", f"{vy:.6f}", f"{vz:.6f}",
+                    f"{wx:.6f}", f"{wy:.6f}", f"{wz:.6f}",
+                    f"{s.jitter_s:.6f}",
+                    f"{s.inflight}",
+                    f"{s.ack_p50_ms:.3f}",
+                    f"{s.ack_p95_ms:.3f}",
+                    f"{s.ack_max_ms:.3f}",
+                    f"{s.backlog_flag}",
+                ])
+
     def _save_plot(self, path: str, reason: str):
         if not self.obs_log:
             return
-        t0 = self.stream_start_wall if self.stream_start_wall is not None else self.obs_log[0].t_wall
-        t = [(s.t_wall - t0) for s in self.obs_log]
-        meas_z = [s.meas_z for s in self.obs_log]
-        ref_z = [s.ref_z_latest for s in self.obs_log]
-        err_mm = [s.inst_err_m * 1000.0 for s in self.obs_log]
-        lag = [s.lag_est_s for s in self.obs_log]
-        ack = [s.ack_last_ms for s in self.obs_log]
-        inflight = [s.inflight for s in self.obs_log]
 
-        plt.figure(figsize=(12, 8))
+        t0 = self.stream_start_wall if self.stream_start_wall is not None else self.obs_log[0].t_wall
+        t = [s.t_wall - t0 for s in self.obs_log]
+
+        meas_x = [s.meas_pose_6d[0] for s in self.obs_log]
+        meas_y = [s.meas_pose_6d[1] for s in self.obs_log]
+        meas_z = [s.meas_pose_6d[2] for s in self.obs_log]
+        ref_x = [s.ref_pose_6d[0] for s in self.obs_log]
+        ref_y = [s.ref_pose_6d[1] for s in self.obs_log]
+        ref_z = [s.ref_pose_6d[2] for s in self.obs_log]
+
+        plt.figure(figsize=(12, 9))
 
         ax1 = plt.subplot(3, 1, 1)
-        ax1.plot(t, ref_z, label="ref_z (m)")
-        ax1.plot(t, meas_z, label="meas_z (m)")
-        ax1.set_ylabel("Z (m)")
+        ax1.plot(t, ref_x, label="ref_x (m)")
+        ax1.plot(t, meas_x, label="meas_x (m)")
+        ax1.set_ylabel("X (m)")
         ax1.set_title(f"PVT Split Nodes: Generator -> Control | reason={reason}")
         ax1.legend(loc="upper right")
         ax1.grid(True)
 
         ax2 = plt.subplot(3, 1, 2)
-        ax2.plot(t, err_mm, label="inst_err (mm)")
-        ax2.plot(t, lag, label="lag_est (s)")
-        ax2.set_ylabel("Error / Lag")
+        ax2.plot(t, ref_y, label="ref_y (m)")
+        ax2.plot(t, meas_y, label="meas_y (m)")
+        ax2.set_ylabel("Y (m)")
         ax2.legend(loc="upper right")
         ax2.grid(True)
 
         ax3 = plt.subplot(3, 1, 3)
-        ax3.plot(t, ack, label="ack_last (ms)")
-        ax3.plot(t, inflight, label="inflight (count)")
+        ax3.plot(t, ref_z, label="ref_z (m)")
+        ax3.plot(t, meas_z, label="meas_z (m)")
         ax3.set_xlabel("Time (s)")
-        ax3.set_ylabel("Ack / inflight")
+        ax3.set_ylabel("Z (m)")
         ax3.legend(loc="upper right")
         ax3.grid(True)
 
