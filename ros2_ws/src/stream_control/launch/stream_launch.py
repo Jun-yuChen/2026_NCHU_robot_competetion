@@ -25,9 +25,9 @@ def generate_launch_description():
                 'stall_timeout_s': 1.0,
 
                 # Safty limits
-                'translation_speed_limit_mps': 0.06,
+                'translation_speed_limit_mps': 0.15,
                 'rotation_speed_limit_dp': 10.0,
-                'translation_step_limit_m': 0.0005,  # Effectively 0.05 m/s (100 Hz control frequency so *100)
+                'translation_step_limit_m': 0.0007,  # Effectively 0.07 m/s (100 Hz control frequency so *100)
                 'rotation_step_limit_deg': 0.1,
             }],
         ),

@@ -22,8 +22,9 @@ def generate_launch_description():
 
                 'spiral_pitch_mm': 3.0,
                 'spiral_max_radius_mm': 50.0,
-                'spiral_search_speed_mm_s': 20.0,
+                'spiral_search_speed_mm_s': 30.0,
 
+                'hole_testing_threshold_mm': 3,
                 'touch_force_tol_n': 0.3,
                 'align_force': 0.3,
                 'insert_force': 6.0,

@@ -142,6 +142,7 @@ class SpiralSearchControllerNode(Node):
 
         # ----- alignment / insertion -----
         self.declare_parameter('position_steady_state_tolerance_mm', 0.05)
+        self.declare_parameter('hole_testing_threshold_mm', 5)
         self.declare_parameter('steady_state_window_s', 0.3)
         self.declare_parameter("align_force", 0.4)   # Fz drops below this => hole/peg aligned
         self.declare_parameter("insert_force", 5.0)  # z-force target once aligned (the "peg" phase)
@@ -184,6 +185,11 @@ class SpiralSearchControllerNode(Node):
         self.position_steady_state_tolerance_m = (
             self.get_parameter('position_steady_state_tolerance_mm').value / 1000.0
         )
+
+        self.hole_testing_threshold_m = (
+            self.get_parameter('hole_testing_threshold_mm').value / 1000.0
+        )
+
         steady_state_window_s = self.get_parameter('steady_state_window_s').value
         # ctrl_hz is fixed by the timer period, so a time window converts directly
         # to a sample count for the rolling buffers below.
@@ -449,11 +455,11 @@ class SpiralSearchControllerNode(Node):
         elif self.state == SearchState.HOLE_TESTING:
             if self._check_steady_state(self._hole_test_z_history, current_z_g):
                 moved_m = abs(current_z_g - self.surface_height_g)
-                if moved_m <= self.position_steady_state_tolerance_m:
+                if moved_m <= self.hole_testing_threshold_m:
                     # settled without sinking -- resting on the surface, not a hole
                     self.get_logger().info(
                         f"[NOT A HOLE] settled {moved_m*1000:.3f}mm from surface "
-                        f"(tol={self.position_steady_state_tolerance_m*1000:.3f}mm) "
+                        f"(tol={self.hole_testing_threshold_m*1000:.3f}mm) "
                         f"-- resuming spiral from the current position"
                     )
                     self._monitor_ref_pos_base = current_flange_pos_base.copy()
@@ -573,7 +579,7 @@ class SpiralSearchControllerNode(Node):
                 return
             if resp.result != PVTCommand.Response.ROBOT_OK:
                 self._error_count += 1
-                self.get_logger().error(
+                self.get_logger().warn(
                     f"[GEN {tick:03d}] ROBOT_ERROR from control node: {resp.message}"
                 )
 
@@ -588,7 +594,7 @@ class SpiralSearchControllerNode(Node):
                 status = f"SEARCHING (spiral_idx={self.spiral_idx}/{len(self.spiral_traj)})"
             else:
                 status = "WAITING_TOUCH"
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[GEN {self.tick:03d}] z_g={current_z_g:+.5f} vz_g={vz_g:+.3f} "
                 f"base=({target_pos_base[0]:.4f},{target_pos_base[1]:.4f},{target_pos_base[2]:.4f}) "
                 f"inflight={self._inflight} ({status})"
