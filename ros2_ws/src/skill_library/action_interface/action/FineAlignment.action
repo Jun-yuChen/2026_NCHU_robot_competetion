@@ -1,0 +1,24 @@
+# Request
+
+---
+# Result
+uint8 SUCCESS=0
+uint8 FAILURE=1
+uint8 CANCELLED=2
+uint8 TIMEOUT=3
+uint8 ERROR=4
+
+uint8 status
+string message
+---
+# Feedback
+uint8 INITIALIZING=0
+uint8 WAITING_TOUCH=1
+uint8 SEARCHING=2
+uint8 HOLE_TESTING=3
+uint8 INSERTING=4
+uint8 COMPLETED=5
+
+uint8 state
+string message
+float32 progress

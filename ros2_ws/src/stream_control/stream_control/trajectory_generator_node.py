@@ -87,6 +87,8 @@ class TrajectoryGeneratorNode(Node):
     def __init__(self):
         super().__init__("pvt_trajectory_generator")
 
+        self.PVT_SERVER_CLIENT_ID = "TrajectoryGeneratorNode"
+
         # ----- parameters -----
         self.declare_parameter("ctrl_hz", 100.0)
         self.declare_parameter("duration_s", 6.0)
@@ -203,6 +205,8 @@ class TrajectoryGeneratorNode(Node):
 
         req = PVTCommand.Request()
         req.header.stamp = self.get_clock().now().to_msg()
+        req.client_id = self.PVT_SERVER_CLIENT_ID
+        
         req.tick = self.tick
         req.is_last = (self.tick == self.total_points - 1)
 

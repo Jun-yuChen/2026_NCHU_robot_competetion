@@ -53,6 +53,32 @@ published before the subscriber matches are silently dropped.
 
 This node has NO knowledge of the send_script service, SendScript I/O,
 ack latency, or CSV/PNG logging -- that all lives in robot_control_node.py.
+
+Action server
+-------------
+This node also serves the FineAlignment action ('fine_alignment'). It
+persists across goals rather than exiting after one insertion: the FSM
+above (state, tick, spiral_idx, the steady-state histories, ...) is now
+per-goal state that _reset_fsm_state() puts back to scratch at the start
+of every execute_callback, instead of per-process state set up once in
+__init__. optoforce_node and stream_control_node are unaffected by any of
+this -- they're started once (same spiral_search_launch.py as before) and
+just sit there serving sensor data / the PVTCommand service across
+however many goals this node runs.
+
+_ctrl_tick still runs on a plain ROS timer, same as before, in the node's
+default (mutually-exclusive) callback group -- so it's still effectively
+single-threaded with respect to itself and the feedback/wrench
+subscriptions, exactly as when this was a run-once script. execute_callback
+runs in a separate ReentrantCallbackGroup on a MultiThreadedExecutor
+thread and never touches FSM state directly: it only blocks on
+_feedback_q, which _ctrl_tick pushes to on every transition (and a
+heartbeat), and turns that into action feedback / the final Result. The
+one thing _ctrl_tick does need from execute_callback's side is
+_active_goal_handle, so it can notice a cancellation itself and unwind
+the stream the same way it already unwinds for a completion, a max-force
+trip, or a duration_s timeout -- see the class docstring for SearchState
+and _ctrl_tick's cancellation check for how that mirrors the other three.
 """
 
 import math
@@ -61,18 +87,24 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional
 from collections import deque
+from queue import Empty, Queue
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 from stream_control.PI_controller import PI_controller
 
 from geometry_msgs.msg import WrenchStamped
+from tm_msgs.srv import SetPositions, SetEvent, SetIO
 from tm_msgs.msg import FeedbackState
 from custom_interface.srv import PVTCommand
+from action_interface.action import FineAlignment
 
 
 class SearchState(Enum):
@@ -114,10 +146,31 @@ class SearchState(Enum):
     INSERTING = auto()
 
 
+@dataclass
+class _TickUpdate:
+    """One item pushed onto self._feedback_q by _ctrl_tick, drained by
+    execute_callback (a different thread) and turned into either action
+    Feedback or the final Result. Purely internal -- never leaves this
+    process, so it's a plain dataclass rather than a message type.
+
+    terminal=False -> an in-progress update: `state` is a
+      FineAlignment.Feedback.* constant, forwarded as-is via
+      goal_handle.publish_feedback().
+    terminal=True  -> the goal is over: `result_status` is a
+      FineAlignment.Result.* constant, forwarded via goal_handle.succeed()
+      /abort()/canceled() (execute_callback picks which based on
+      result_status) plus the Result message itself.
+    """
+    terminal: bool
+    state: int = FineAlignment.Feedback.INITIALIZING
+    message: str = ""
+    progress: float = 0.0
+    result_status: int = FineAlignment.Result.SUCCESS
+
+
 class SpiralSearchControllerNode(Node):
     def __init__(self):
         super().__init__("spiral_search_controller")
-        self.PVT_SERVER_CLIENT_ID = "spiral_search_node"
 
         self.touch_force = 1  # 1N
 
@@ -131,6 +184,11 @@ class SpiralSearchControllerNode(Node):
         self.declare_parameter("pvt_point_time_ratio", 0.9)  # Don't touch this
         self.declare_parameter("command_service", "pvt_command")
         self.declare_parameter("service_wait_log_period_s", 2.0)
+        # How long execute_callback will wait, per goal, for feedback_states
+        # / optoforce/wrench / the PVTCommand service before aborting with
+        # ERROR. Separate from service_wait_log_period_s above (that's just
+        # the log throttle within this wait).
+        self.declare_parameter("goal_ready_timeout_s", 10.0)
 
         # ----- spiral search parameters (in the flange's x-y plane) -----
         # Archimedean spiral: r(theta) = (spiral_pitch_mm / 2*pi) * theta
@@ -143,6 +201,7 @@ class SpiralSearchControllerNode(Node):
 
         # ----- alignment / insertion -----
         self.declare_parameter('position_steady_state_tolerance_mm', 0.05)
+        self.declare_parameter('hole_force_delta_N', 0.5)
         self.declare_parameter('hole_testing_threshold_mm', 5)
         self.declare_parameter('steady_state_window_s', 0.3)
         self.declare_parameter("align_force", 0.4)   # Fz drops below this => hole/peg aligned
@@ -150,9 +209,9 @@ class SpiralSearchControllerNode(Node):
         self.declare_parameter("max_force_n", 8.0)   # hard safety cutoff, must stay above insert_force
 
         self.force_controller = PI_controller(
-            Kp = self.get_parameter("PI_controller_Kp").value ,
-            Ki = self.get_parameter("PI_controller_Ki").value ,
-            integral_limit = self.get_parameter("PI_controller_integral_limit").value ,
+            Kp=self.get_parameter("PI_controller_Kp").value,
+            Ki=self.get_parameter("PI_controller_Ki").value,
+            integral_limit=self.get_parameter("PI_controller_integral_limit").value,
         )
 
         self.ctrl_hz = float(self.get_parameter("ctrl_hz").value)
@@ -187,6 +246,10 @@ class SpiralSearchControllerNode(Node):
             self.get_parameter('position_steady_state_tolerance_mm').value / 1000.0
         )
 
+        self.hole_force_delta_N = (
+            self.get_parameter('hole_force_delta_N').value
+        )
+
         self.hole_testing_threshold_m = (
             self.get_parameter('hole_testing_threshold_mm').value / 1000.0
         )
@@ -196,10 +259,12 @@ class SpiralSearchControllerNode(Node):
         # to a sample count for the rolling buffers below.
         self._steady_state_len = max(2, round(steady_state_window_s * self.ctrl_hz))
 
+        self._search_z_history = deque(maxlen=self._steady_state_len)
         self._hole_test_z_history = deque(maxlen=self._steady_state_len)
         self._insert_z_history = deque(maxlen=self._steady_state_len)
         self.surface_height_g = None
         self._shutdown_requested = False
+        self._pending_terminal: Optional["_TickUpdate"] = None
 
         self.align_force = float(self.get_parameter("align_force").value)
         self.insert_force = float(self.get_parameter("insert_force").value)
@@ -230,15 +295,39 @@ class SpiralSearchControllerNode(Node):
         # command itself.
         self._monitor_ref_pos_base: Optional[np.ndarray] = None
 
-        self.spiral_traj: List[tuple] = []
+        # Purely a function of the static spiral_* params above, so
+        # generated once here and reused for every goal (only spiral_idx,
+        # reset per-goal in _reset_fsm_state, tracks where a given run is
+        # along it).
+        self.spiral_traj: List[tuple] = self._generate_spiral_trajectory()
         self.spiral_idx = 0
+        self.get_logger().info(
+            f"Generated spiral trajectory: {len(self.spiral_traj)} points "
+            f"(pitch={self.spiral_pitch_mm:.2f}mm, max_r={self.spiral_max_radius_mm:.2f}mm, "
+            f"speed={self.spiral_search_speed_mm_s:.2f}mm/s)"
+        )
 
         command_service = self.get_parameter("command_service").value
+        self._command_service_name = command_service
         self.service_wait_log_period_s = float(self.get_parameter("service_wait_log_period_s").value)
+        self.goal_ready_timeout_s = float(self.get_parameter("goal_ready_timeout_s").value)
         self.cmd_client = self.create_client(PVTCommand, command_service)
 
+        # Subscriptions live for the node's whole lifetime, not per-goal --
+        # optoforce_node and stream_control_node's feedback publisher are
+        # background nodes now (see spiral_search_launch.py), so there's no
+        # reason this node's picture of the arm/sensor should go stale
+        # between goals. These stay on the node's default (mutually
+        # exclusive) callback group, same group as _ctrl_tick and the
+        # PVTCommand response callback -- see the class docstring for why
+        # that matters (it's what keeps the FSM effectively single-threaded
+        # even though this is now a MultiThreadedExecutor node).
         self.create_subscription(FeedbackState, "feedback_states", self._fb_cb, 10)
         self.create_subscription(WrenchStamped, 'optoforce/wrench', self._FTsensor_cb, 10)
+
+
+        # Create client for control the gripper
+        self.io_cli = self.create_client(SetIO, '/set_io')
 
         self.feedback_is_avaliable = False
 
@@ -251,18 +340,222 @@ class SpiralSearchControllerNode(Node):
 
         self._inflight = 0
         self._error_count = 0
-        self._last_wait_log_wall = 0.0
 
-        self.startup_timer = self.create_timer(0.05, self._startup_tick)
         self.ctrl_timer = None
-
         self.prev_time = None  # For control loop
 
-        self.get_logger().info(
-            f"{self.ctrl_hz:.1f}Hz, {self.total_points} points, "
-            f"calling PVTCommand service '{command_service}', "
-            f"orientation held passively at whatever it is on startup"
+        # ----- action server -----
+        # execute_callback blocks (queue.get / time.sleep) for the whole
+        # goal, so it needs its own callback group, separate from the
+        # default one _ctrl_tick/_fb_cb/_FTsensor_cb/the PVTCommand
+        # response callback all sit in -- otherwise it would starve them
+        # for the entire run. See main() for the matching
+        # MultiThreadedExecutor.
+        self._action_cb_group = ReentrantCallbackGroup()
+        self._goal_active = False
+        self._active_goal_handle = None
+        self._feedback_q: "Queue[_TickUpdate]" = Queue()
+
+        self._action_server = ActionServer(
+            self,
+            FineAlignment,
+            "fine_alignment",
+            execute_callback=self._execute_callback,
+            goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
+            callback_group=self._action_cb_group,
         )
+
+        self.get_logger().info(
+            f"{self.ctrl_hz:.1f}Hz, {self.total_points} points/goal, "
+            f"calling PVTCommand service '{command_service}', "
+            f"orientation held passively at whatever it is when each goal starts -- "
+            f"serving FineAlignment action 'fine_alignment'"
+        )
+
+    # ---------- action server callbacks ----------
+    def _goal_callback(self, goal_request):
+        if self._goal_active:
+            self.get_logger().warn("Rejecting goal: fine alignment already running")
+            return GoalResponse.REJECT
+        if not self.cmd_client.service_is_ready():
+            self.get_logger().warn(
+                f"Rejecting goal: PVTCommand service '{self._command_service_name}' "
+                f"not available (is stream_control_node up?)"
+            )
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def _cancel_callback(self, goal_handle):
+        # Actually stopping the robot happens in _ctrl_tick, which notices
+        # self._active_goal_handle.is_cancel_requested -- see there.
+        self.get_logger().info("Cancel requested")
+        return CancelResponse.ACCEPT
+
+    def _execute_callback(self, goal_handle):
+        self._goal_active = True
+        self._active_goal_handle = goal_handle
+        try:
+            return self._run_goal(goal_handle)
+        finally:
+            self._active_goal_handle = None
+            self._goal_active = False
+
+    def _run_goal(self, goal_handle):
+        # Drop anything left in the queue from a previous goal (there
+        # shouldn't be any -- every terminal path drains/returns cleanly --
+        # but a goal is expensive enough on real hardware that starting
+        # clean is worth the one extra check).
+        while not self._feedback_q.empty():
+            try:
+                self._feedback_q.get_nowait()
+            except Empty:
+                break
+
+        self._reset_fsm_state()
+        self._publish_feedback(goal_handle, FineAlignment.Feedback.INITIALIZING,
+                                "waiting for feedback_states / optoforce/wrench", 0.0)
+
+        if not self._wait_until_ready(goal_handle):
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                return self._make_result(FineAlignment.Result.CANCELLED, "cancelled while waiting to start")
+            goal_handle.abort()
+            return self._make_result(
+                FineAlignment.Result.ERROR,
+                f"feedback_states/optoforce/wrench not available within "
+                f"goal_ready_timeout_s={self.goal_ready_timeout_s:.1f}s",
+            )
+
+        # Reference point for insertion-axis travel monitoring -- see
+        # class docstring / _ctrl_tick. Recorded fresh for every goal,
+        # from wherever the flange happens to be right now (spiral_traj
+        # itself was already generated once in __init__ -- see there).
+        self._monitor_ref_pos_base = self.T_B_G[:3, 3].copy()
+        self.get_logger().info(
+            f"monitor ref(base)={np.round(self._monitor_ref_pos_base, 4).tolist()}"
+        )
+        self._publish_feedback(
+            goal_handle, FineAlignment.Feedback.WAITING_TOUCH,
+            f"spiral trajectory ready ({len(self.spiral_traj)} points) -- waiting for touch",
+            0.0,
+        )
+
+        self.ctrl_timer = self.create_timer(self.ctrl_dt, self._ctrl_tick)
+
+        while True:
+            try:
+                item = self._feedback_q.get(timeout=0.2)
+            except Empty:
+                continue
+
+            if not item.terminal:
+                self._publish_feedback(goal_handle, item.state, item.message, item.progress)
+                continue
+
+            self._cleanup_timer()
+
+            time.sleep(1.5) # Wait PVT to exit
+            self.get_logger().info("PVT should END now")
+
+            if item.result_status == FineAlignment.Result.SUCCESS:
+                goal_handle.succeed()
+                self._set_gripper(0.0)
+
+            elif item.result_status == FineAlignment.Result.CANCELLED:
+                goal_handle.canceled()
+            else:
+                goal_handle.abort()
+            return self._make_result(item.result_status, item.message)
+
+    def _reset_fsm_state(self):
+        """Put every piece of per-goal FSM state back to scratch. Static,
+        parameter-derived things (spiral_traj, PI controller gains, ctrl_dt,
+        total_points, ...) are NOT touched here -- they don't change
+        between goals."""
+        self.state = SearchState.WAITING_TOUCH
+        self.tick = 0
+        self.spiral_idx = 0
+        self._shutdown_requested = False
+        self._pending_terminal = None
+        self.surface_height_g = None
+        self._search_z_history.clear()
+        self._hole_test_z_history.clear()
+        self._insert_z_history.clear()
+        self.prev_time = None
+        self._inflight = 0
+        self._error_count = 0
+        self.force_controller.reset()
+
+    def _wait_until_ready(self, goal_handle) -> bool:
+        """Block (this is execute_callback's own thread, blocking here is
+        fine) until feedback_states and optoforce/wrench have both
+        delivered at least one message, or goal_ready_timeout_s elapses,
+        or the goal is cancelled. Returns False on timeout or cancel."""
+        deadline = time.monotonic() + self.goal_ready_timeout_s
+        last_log = 0.0
+        while not (self.feedback_is_avaliable and self.FT_is_avaliable):
+            if goal_handle.is_cancel_requested:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            now = time.monotonic()
+            if (now - last_log) >= self.service_wait_log_period_s:
+                last_log = now
+                self.get_logger().info(
+                    "Waiting for feedback_states / optoforce/wrench "
+                    f"(feedback={self.feedback_is_avaliable}, FT={self.FT_is_avaliable})..."
+                )
+            time.sleep(0.05)
+        return True
+
+    def _publish_feedback(self, goal_handle, state: int, message: str, progress: float):
+        fb = FineAlignment.Feedback()
+        fb.state = state
+        fb.message = message
+        fb.progress = float(progress)
+        goal_handle.publish_feedback(fb)
+
+    @staticmethod
+    def _make_result(status: int, message: str):
+        result = FineAlignment.Result()
+        result.status = status
+        result.message = message
+        return result
+
+    def _cleanup_timer(self):
+        if self.ctrl_timer is None:
+            return
+        try:
+            self.ctrl_timer.cancel()
+        except Exception:
+            pass
+        try:
+            self.destroy_timer(self.ctrl_timer)
+        except Exception:
+            pass
+        self.ctrl_timer = None
+
+    def _send_final_hold(self, is_last: bool = True):
+        """Send one PVTCommand holding the flange exactly where it is right
+        now. Used to end a stream cleanly (cancellation) without falling
+        through the rest of a normal tick's force/spiral computation --
+        there's nothing to compute, we just want to stop exactly here."""
+        current_flange_pos_base = self.T_B_G[:3, 3]
+        R_B_G_live = self.T_B_G[:3, :3]
+        target_orient_deg = R.from_matrix(R_B_G_live).as_euler('xyz', degrees=True)
+
+        req = PVTCommand.Request()
+        req.header.stamp = self.get_clock().now().to_msg()
+        req.tick = self.tick
+        req.is_last = is_last
+        req.x_m, req.y_m, req.z_m = current_flange_pos_base.tolist()
+        req.rx_deg, req.ry_deg, req.rz_deg = target_orient_deg.tolist()
+        req.vx_mps, req.vy_mps, req.vz_mps = 0.0, 0.0, 0.0
+        req.wx_dps, req.wy_dps, req.wz_dps = 0.0, 0.0, 0.0
+        req.point_time_s = self.ctrl_dt * self.pvt_point_time_ratio
+        self.cmd_client.call_async(req)
+        self.tick += 1
 
     # ---------- ROS callbacks ----------
     def _fb_cb(self, msg: FeedbackState):
@@ -351,7 +644,7 @@ class SpiralSearchControllerNode(Node):
 
         return traj
 
-    def _check_steady_state(self, history: deque, z: float) -> bool:
+    def _check_steady_state(self, history: deque, z: float, tol=None) -> bool:
         """Push z into a rolling window; True once the window is full and its
         spread (max-min) is within position_steady_state_tolerance_m.
 
@@ -359,47 +652,50 @@ class SpiralSearchControllerNode(Node):
         a window that isn't full yet says nothing about steadiness, so it must
         not report True just because the spread-so-far happens to be small.
         """
+        if tol is None:
+            tol = self.position_steady_state_tolerance_m
+
         history.append(z)
         if len(history) < history.maxlen:
             return False
-        return (max(history) - min(history)) <= self.position_steady_state_tolerance_m
+        return (max(history) - min(history)) <= tol
 
-    def _startup_tick(self):
-        if (not self.feedback_is_avaliable) or (not self.FT_is_avaliable):
-            return
+    def _set_gripper(self, state=0):
+        """
+        state = 0.0 open the gripper
+        state = 1.0 close the gripper
+        """
+        res = SetIO.Request()
+        res.module = 1  # IO module 1
+        res.type = 1    # digital IO
+        res.pin = 0     # pin 0
+        res.state = float(state)
+        self.io_cli.call_async(res)
 
-        if not self.cmd_client.service_is_ready():
-            now = time.time()
-            if (now - self._last_wait_log_wall) >= self.service_wait_log_period_s:
-                self._last_wait_log_wall = now
-                self.get_logger().info(
-                    "Waiting for robot control node's PVTCommand service..."
-                )
-            return  # do NOT generate/start streaming until the server exists
-
-        self.startup_timer.cancel()
-
-        self.get_logger().info("✓ PVTCommand service is up")
-
-        # record the starting flange position, purely as the reference point
-        # for insertion-axis travel monitoring (see class docstring) --
-        # the command loop itself needs no such reference
-        self._monitor_ref_pos_base = self.T_B_G[:3, 3].copy()
-        self.spiral_traj = self._generate_spiral_trajectory()
-
-        self.get_logger().info(
-            f"Generated spiral trajectory: {len(self.spiral_traj)} points "
-            f"(pitch={self.spiral_pitch_mm:.2f}mm, max_r={self.spiral_max_radius_mm:.2f}mm, "
-            f"speed={self.spiral_search_speed_mm_s:.2f}mm/s), "
-            f"monitor ref(base)={np.round(self._monitor_ref_pos_base, 4).tolist()}"
-        )
-
-        self.ctrl_timer = self.create_timer(self.ctrl_dt, self._ctrl_tick)
+    #=======================================================================================================================
+    #===================== MAIN CONTROL LOOP ===============================================================================
+    #=======================================================================================================================
 
     def _ctrl_tick(self):
         if (not self.feedback_is_avaliable) or (not self.FT_is_avaliable):
             return
         if self._shutdown_requested:
+            return
+
+        # Mirrors the max-force safety branch further down: notice it,
+        # send one hold-in-place point with is_last=True so
+        # stream_control_node gets a clean PVTExit instead of waiting on
+        # its stall watchdog, stop the timer, report it, and stop -- all
+        # in this one tick, same pattern as every other terminal path here.
+        if self._active_goal_handle is not None and self._active_goal_handle.is_cancel_requested:
+            self.get_logger().info("[CANCEL] cancel requested -- sending final hold point and stopping")
+            self._send_final_hold(is_last=True)
+            self.ctrl_timer.cancel()
+            self._shutdown_requested = True
+            self._feedback_q.put(_TickUpdate(
+                terminal=True, result_status=FineAlignment.Result.CANCELLED,
+                message="cancelled by client",
+            ))
             return
 
         now = self.get_clock().now()
@@ -438,12 +734,17 @@ class SpiralSearchControllerNode(Node):
             if abs(self.touch_force - fz) <= self.touch_force_tol_n:
                 self.state = SearchState.SEARCHING
                 self.spiral_idx = 0
+                self._search_z_history.clear()
                 self.get_logger().info(
                     f"[TOUCH] contact detected (Fz={fz:.3f}N) -- starting spiral search"
                 )
+                self._feedback_q.put(_TickUpdate(
+                    terminal=False, state=FineAlignment.Feedback.SEARCHING,
+                    message=f"touch detected (Fz={fz:.3f}N) -- starting spiral search",
+                ))
 
         elif self.state == SearchState.SEARCHING:
-            if fz < self.align_force:
+            if (self.align_force - fz) > self.hole_force_delta_N and self._check_steady_state(self._search_z_history, current_z_g):
                 self.state = SearchState.HOLE_TESTING
                 self.surface_height_g = current_z_g
                 self._hole_test_z_history.clear()
@@ -452,6 +753,10 @@ class SpiralSearchControllerNode(Node):
                     f"align_force={self.align_force:.3f}N) -- testing for a real "
                     f"hole from surface_height(g)={self.surface_height_g:.5f}m"
                 )
+                self._feedback_q.put(_TickUpdate(
+                    terminal=False, state=FineAlignment.Feedback.HOLE_TESTING,
+                    message=f"candidate alignment (Fz={fz:.3f}N) -- testing for a real hole",
+                ))
 
         elif self.state == SearchState.HOLE_TESTING:
             if self._check_steady_state(self._hole_test_z_history, current_z_g):
@@ -465,8 +770,13 @@ class SpiralSearchControllerNode(Node):
                     )
                     self._monitor_ref_pos_base = current_flange_pos_base.copy()
                     self.spiral_idx = 0
+                    self._search_z_history.clear()
                     self._hole_test_z_history.clear()
                     self.state = SearchState.SEARCHING
+                    self._feedback_q.put(_TickUpdate(
+                        terminal=False, state=FineAlignment.Feedback.SEARCHING,
+                        message=f"not a hole (settled {moved_m*1000:.3f}mm from surface) -- resuming spiral",
+                    ))
                 else:
                     # sank in past tolerance -- this is the hole
                     self.get_logger().info(
@@ -475,6 +785,10 @@ class SpiralSearchControllerNode(Node):
                     )
                     self._insert_z_history.clear()
                     self.state = SearchState.INSERTING
+                    self._feedback_q.put(_TickUpdate(
+                        terminal=False, state=FineAlignment.Feedback.INSERTING,
+                        message=f"hole confirmed (settled {moved_m*1000:.3f}mm from surface) -- inserting",
+                    ))
 
         elif self.state == SearchState.INSERTING:
             if self._check_steady_state(self._insert_z_history, current_z_g):
@@ -484,13 +798,31 @@ class SpiralSearchControllerNode(Node):
                     f"{self._steady_state_len} ticks -- holding and stopping"
                 )
                 self._shutdown_requested = True
+                # NOT pushed to self._feedback_q here -- execute_callback's
+                # thread would be free to pop it and call _cleanup_timer()
+                # (which nulls self.ctrl_timer) while THIS tick is still
+                # running and hasn't reached its own
+                # `self.ctrl_timer.cancel()` yet (below, in the shared
+                # `if req.is_last:` block) -- that's the
+                # AttributeError: 'NoneType' object has no attribute
+                # 'cancel' race. Stash it and push only once this tick is
+                # done touching self.ctrl_timer, same as every other
+                # terminal path already does.
+                self._pending_terminal = _TickUpdate(
+                    terminal=True, result_status=FineAlignment.Result.SUCCESS,
+                    message=(
+                        f"insertion complete, z steady within "
+                        f"{self.position_steady_state_tolerance_m*1000:.3f}mm"
+                    ),
+                )
 
         # ============ 2) Z FORCE OUTPUT (insertion axis) ============
         # A step from wherever the flange is *right now* -- no reference
         # point needed, this is a pure delta.
         z_target = (self.insert_force
-                    if self.state in (SearchState.HOLE_TESTING, SearchState.INSERTING)
-                    else self.touch_force)
+                            if self.state in (SearchState.HOLE_TESTING, SearchState.INSERTING)
+                            else self.touch_force
+                    )
 
         error = z_target - fz
         delta_z = self.force_controller.update(error, dt)
@@ -540,9 +872,12 @@ class SpiralSearchControllerNode(Node):
 
         req = PVTCommand.Request()
         req.header.stamp = self.get_clock().now().to_msg()
-        req.client_id = self.PVT_SERVER_CLIENT_ID
         req.tick = self.tick
-        req.is_last = (self.tick == self.total_points - 1) or self._shutdown_requested
+        # Distinguish "ran out of duration_s without completing" from a
+        # real completion, so it can be reported as TIMEOUT instead of
+        # silently looking identical to success.
+        reached_time_limit = (self.tick == self.total_points - 1) and not self._shutdown_requested
+        req.is_last = reached_time_limit or self._shutdown_requested
 
         req.x_m, req.y_m, req.z_m = target_pos_base.tolist()
         req.rx_deg, req.ry_deg, req.rz_deg = target_orient_deg.tolist()
@@ -561,7 +896,21 @@ class SpiralSearchControllerNode(Node):
             req.x_m, req.y_m, req.z_m = current_flange_pos_base.tolist()
             req.rx_deg, req.ry_deg, req.rz_deg = target_orient_deg.tolist()
             req.vx_mps, req.vy_mps, req.vz_mps = 0.0, 0.0, 0.0
+            req.is_last = True
+            self.cmd_client.call_async(req)
+            self.get_logger().error(
+                f"[SAFETY] max_force_n exceeded (Fz={self.force_observe.z:.2f}N > "
+                f"{self.max_force_n:.2f}N) -- holding in place and ending stream"
+            )
             self.ctrl_timer.cancel()
+            self._shutdown_requested = True
+            self._feedback_q.put(_TickUpdate(
+                terminal=True, result_status=FineAlignment.Result.FAILURE,
+                message=(
+                    f"max_force_n exceeded (Fz={self.force_observe.z:.2f}N > "
+                    f"{self.max_force_n:.2f}N)"
+                ),
+            ))
             return
 
         this_tick = self.tick
@@ -570,6 +919,25 @@ class SpiralSearchControllerNode(Node):
 
         if req.is_last:
             self.ctrl_timer.cancel()
+            if reached_time_limit:
+                self.get_logger().warn(
+                    f"[TIMEOUT] duration_s={self.duration_s:.1f}s elapsed while in "
+                    f"{self.state.name} without completing insertion"
+                )
+                self._shutdown_requested = True
+                self._feedback_q.put(_TickUpdate(
+                    terminal=True, result_status=FineAlignment.Result.TIMEOUT,
+                    message=(
+                        f"duration_s={self.duration_s:.1f}s elapsed while in "
+                        f"{self.state.name} without completing insertion"
+                    ),
+                ))
+            elif self._pending_terminal is not None:
+                # The INSERTING-complete case from above -- safe to hand
+                # off now that self.ctrl_timer.cancel() has already run on
+                # this thread.
+                self._feedback_q.put(self._pending_terminal)
+                self._pending_terminal = None
 
         def _done_cb(fut, tick=this_tick):
             self._inflight -= 1
@@ -590,30 +958,48 @@ class SpiralSearchControllerNode(Node):
         if self.tick % 10 == 0:
             if self.state == SearchState.INSERTING:
                 status = f"INSERTING (target={self.insert_force:.2f}N)"
+                heartbeat_state, heartbeat_progress = FineAlignment.Feedback.INSERTING, 0.0
             elif self.state == SearchState.HOLE_TESTING:
                 status = f"HOLE_TESTING (surface_g={self.surface_height_g:.5f}m)"
+                heartbeat_state, heartbeat_progress = FineAlignment.Feedback.HOLE_TESTING, 0.0
             elif self.state == SearchState.SEARCHING:
                 status = f"SEARCHING (spiral_idx={self.spiral_idx}/{len(self.spiral_traj)})"
+                heartbeat_state = FineAlignment.Feedback.SEARCHING
+                heartbeat_progress = (
+                    self.spiral_idx / len(self.spiral_traj) if self.spiral_traj else 0.0
+                )
             else:
                 status = "WAITING_TOUCH"
+                heartbeat_state, heartbeat_progress = FineAlignment.Feedback.WAITING_TOUCH, 0.0
             self.get_logger().debug(
                 f"[GEN {self.tick:03d}] z_g={current_z_g:+.5f} vz_g={vz_g:+.3f} "
                 f"base=({target_pos_base[0]:.4f},{target_pos_base[1]:.4f},{target_pos_base[2]:.4f}) "
                 f"inflight={self._inflight} ({status})"
             )
+            # Heartbeat, not a transition -- skip it on a tick that already
+            # pushed a terminal update above (COMPLETED/FAILURE/TIMEOUT),
+            # so it doesn't immediately follow that with a stale
+            # in-progress one. (CANCELLED returns before reaching here.)
+            if not self._shutdown_requested:
+                self._feedback_q.put(_TickUpdate(
+                    terminal=False, state=heartbeat_state,
+                    message=status, progress=heartbeat_progress,
+                ))
 
         self.tick += 1
-
-        if self._shutdown_requested:
-            self.get_logger().info("[STOP] insertion complete -- shutting down node")
-            rclpy.shutdown()
 
 
 def main():
     rclpy.init()
     node = SpiralSearchControllerNode()
+    # Needs >=2 threads: execute_callback blocks for the whole goal on its
+    # own ReentrantCallbackGroup, while _ctrl_tick / _fb_cb / _FTsensor_cb /
+    # the PVTCommand response callback (the node's default callback group)
+    # need to keep running concurrently -- see the class docstring.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

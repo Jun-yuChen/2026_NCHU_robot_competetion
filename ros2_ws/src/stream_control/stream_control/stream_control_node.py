@@ -100,8 +100,8 @@ class StreamControlNode(Node):
         # Safty limits
         self.declare_parameter("translation_speed_limit_mps", 0.01)
         self.declare_parameter("rotation_speed_limit_dps", 2.0)
-        self.declare_parameter("translation_step_limit_m", 0.01)  # distance between two adjacent PVT points.
-        self.declare_parameter("rotation_step_limit_deg", 2.0)
+        self.declare_parameter("translation_step_limit_m", 0.001)  # distance between two adjacent PVT points.
+        self.declare_parameter("rotation_step_limit_deg", 0.1)
         self.declare_parameter("stall_timeout_s", 1.0)
 
         self.obs_hz = float(self.get_parameter("obs_hz").value)
@@ -128,6 +128,11 @@ class StreamControlNode(Node):
         
         self.create_service(PVTCommand, command_service, self._cmd_srv_cb)
 
+        # Use client i to prevent more than one clients calling PVT control at the same time.
+        self.busy = False
+        self.active_client_id = None
+        self.settle_timeout_timer = None
+
         # feedback
         self.has_feedback = False
         self.meas_pose_6d: Optional[List[float]] = None
@@ -137,7 +142,7 @@ class StreamControlNode(Node):
         self.streaming = False
         self.stream_start_wall: Optional[float] = None
         self.stream_end_wall: Optional[float] = None
-        self.done = False
+        # Stream lifecycle is controlled by busy/active_client_id; this node is never permanently finalized.
         self._last_cmd_recv_wall: Optional[float] = None
 
         # ack tracking
@@ -188,9 +193,26 @@ class StreamControlNode(Node):
             ]
 
     def _cmd_srv_cb(self, request: PVTCommand.Request, response: PVTCommand.Response):
-        if self.done:
-            response.result = PVTCommand.Response.ROBOT_ERROR
-            response.message = "control node already finalized"
+        # A service remains advertised permanently.  client_id provides the
+        # application-level ownership of the current PVT stream.
+        client_id = request.client_id.strip() if request.client_id else "none"
+
+        if self.busy and client_id != self.active_client_id:
+            response.result = PVTCommand.Response.ROBOT_BUSY
+            response.message = (
+                f"PVT stream is busy (active_client_id='{self.active_client_id}')"
+            )
+            self.get_logger().warn(
+                f"[CTRL {request.tick:03d}] rejecting client '{client_id}': "
+                f"stream owned by '{self.active_client_id}'"
+            )
+            return response
+
+        # After is_last, PVTExit has already been sent.  Do not accept another
+        # point from the old stream while the robot is settling.
+        if self.busy and not self.streaming:
+            response.result = PVTCommand.Response.ROBOT_BUSY
+            response.message = "PVT stream is finishing; wait for the next stream"
             return response
 
         if not self.send_script.service_is_ready():
@@ -202,6 +224,27 @@ class StreamControlNode(Node):
             return response
 
         recv_wall = time.time()
+
+        # First request of a new stream acquires ownership.
+        if not self.busy:
+            self.busy = True
+            self.active_client_id = client_id
+            self.entered_pvt = False
+            self.streaming = False
+            self.stream_start_wall = None
+            self.stream_end_wall = None
+            self._last_cmd_recv_wall = None
+            self._prev_target = None
+            self._ref_pose_latest = None
+            self._cmd_history.clear()
+            self.ctrl_log.clear()
+            self.obs_log.clear()
+            self._overload_streak = 0
+            self._obs_last_log_wall = 0.0
+            self.get_logger().info(
+                f"=== NEW PVT STREAM: client_id='{client_id}' ==="
+            )
+
         self._last_cmd_recv_wall = recv_wall
 
         if not self.entered_pvt:
@@ -209,7 +252,9 @@ class StreamControlNode(Node):
             self._send_async("E001", "PVTEnter(1)")
             self.stream_start_wall = recv_wall
             self.streaming = True
-            self.get_logger().info("=== CTRL STREAM START (PVTEnter sent) ===")
+            self.get_logger().info(
+                f"=== CTRL STREAM START (PVTEnter sent) client_id='{self.active_client_id}' ==="
+            )
 
         # Jitter here = generator's call time -> this node's receipt time,
         # i.e. it captures pipeline (generator timer + DDS/service round
@@ -310,21 +355,33 @@ class StreamControlNode(Node):
             )
         )
 
-        '''
         if request.tick % 10 == 0:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[CTRL {request.tick:03d}] jitter={jitter_s*1000:+.1f}ms "
                 f"inflight={self._inflight} ack_last={self._ack_last_ms:.1f}ms "
                 f"ref_xyz=({x:.4f},{y:.4f},{z:.4f}) "
                 f"ref_rpy=({rx:.2f},{ry:.2f},{rz:.2f})"
             )
-        '''
 
         if request.is_last:
             self.streaming = False
             self.stream_end_wall = time.time()
             self._send_async("E005", "PVTExit()")
-            self.get_logger().info("=== CTRL STREAM END (PVTExit sent) ===")
+            self.get_logger().info(
+                f"=== CTRL STREAM END (PVTExit sent), client_id='{self.active_client_id}' ==="
+            )
+
+            # Keep the node alive and retain ownership during the normal
+            # settling period.  A separate timeout guarantees that lack of
+            # feedback cannot leave the node permanently busy.
+            if self.settle_timeout_timer is not None:
+                try:
+                    self.settle_timeout_timer.cancel()
+                except Exception:
+                    pass
+            self.settle_timeout_timer = self.create_timer(
+                self.settle_timeout_s, self._settle_timeout_tick
+            )
 
         if limit_exceeded:
             response.result = PVTCommand.Response.ROBOT_ERROR
@@ -506,10 +563,9 @@ class StreamControlNode(Node):
             )
         )
 
-        '''
         if (now - self._obs_last_log_wall) >= self.obs_log_period_s:
             self._obs_last_log_wall = now
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[OBS] xyz=({meas[0]:.4f},{meas[1]:.4f},{meas[2]:.4f}) "
                 f"rpy=({meas[3]:.2f},{meas[4]:.2f},{meas[5]:.2f}) "
                 f"err_xyz=({err_pose[0]*1000:+.1f},{err_pose[1]*1000:+.1f},"
@@ -517,10 +573,9 @@ class StreamControlNode(Node):
                 f"err_rpy=({err_pose[3]:+.2f},{err_pose[4]:+.2f},{err_pose[5]:+.2f})deg "
                 f"lag~{lag_est:+.2f}s inflight={self._inflight}"
             )
-        '''
 
         # Keep the original settle criterion: Z velocity must remain small.
-        if self.stream_end_wall is not None and not self.done:
+        if self.stream_end_wall is not None and self.busy:
             t_after = now - self.stream_end_wall
             if t_after > self.settle_timeout_s:
                 self.get_logger().warn("Settle timeout -> stop")
@@ -545,7 +600,7 @@ class StreamControlNode(Node):
         PVTExit, finalize (saving CSV/PNG), and reset stream state so a
         fresh generator run starts clean instead of inheriting stale
         entered_pvt / _prev_target."""
-        if not self.streaming or self.done or self._last_cmd_recv_wall is None:
+        if not self.streaming or not self.busy or self._last_cmd_recv_wall is None:
             return
 
         gap_s = time.time() - self._last_cmd_recv_wall
@@ -558,25 +613,25 @@ class StreamControlNode(Node):
             self.streaming = False
             self.stream_end_wall = time.time()
             self._finalize("stream_stalled")
-            self.entered_pvt = False
-            self._prev_target = None
 
     # ---------- finalize / logging ----------
-    def _finalize(self, reason: str):
-        if self.done:
-            return
-        self.done = True
+    def _settle_timeout_tick(self):
+        """Fallback cleanup timer so a completed stream can never hold the
+        client lock forever if feedback is unavailable."""
+        if self.busy and self.stream_end_wall is not None:
+            self.get_logger().warn(
+                f"Settle timeout ({self.settle_timeout_s:.2f}s) -> finalizing "
+                f"client_id='{self.active_client_id}'"
+            )
+            self._finalize("settle_timeout")
 
-        if self.obs_timer is not None:
-            try:
-                self.obs_timer.cancel()
-            except Exception:
-                pass
-        if self.watchdog_timer is not None:
-            try:
-                self.watchdog_timer.cancel()
-            except Exception:
-                pass
+    def _finalize(self, reason: str):
+        # Finalize only the CURRENT stream.  The ROS node and its service stay
+        # alive so another stream can start immediately after cleanup.
+        if not self.busy:
+            return
+
+        finished_client_id = self.active_client_id
 
         out_dir = self.output_dir
         os.makedirs(out_dir, exist_ok=True)
@@ -594,7 +649,34 @@ class StreamControlNode(Node):
         self.get_logger().info(f"Saved: {obs_csv_path}")
         self.get_logger().info(f"Saved: {control_csv_path}")
         self.get_logger().info(f"Saved: {png_path}")
-        self.get_logger().info(f"Reason: {reason}")
+        self.get_logger().info(
+            f"Reason: {reason}; releasing PVT stream lock for "
+            f"client_id='{finished_client_id}'"
+        )
+
+        # Reset ONLY stream state.  Do not stop/cancel the permanent ROS
+        # observation/watchdog timers.
+        if self.settle_timeout_timer is not None:
+            try:
+                self.settle_timeout_timer.cancel()
+            except Exception:
+                pass
+            self.settle_timeout_timer = None
+
+        self.busy = False
+        self.active_client_id = None
+        self.entered_pvt = False
+        self.streaming = False
+        self.stream_start_wall = None
+        self.stream_end_wall = None
+        self._last_cmd_recv_wall = None
+        self._prev_target = None
+        self._ref_pose_latest = None
+        self._cmd_history.clear()
+        self.ctrl_log.clear()
+        self.obs_log.clear()
+        self._overload_streak = 0
+        self._obs_last_log_wall = 0.0
 
     def _save_obs_samples_csv(self, path: str):
         t0 = self.stream_start_wall if self.stream_start_wall is not None else time.time()
