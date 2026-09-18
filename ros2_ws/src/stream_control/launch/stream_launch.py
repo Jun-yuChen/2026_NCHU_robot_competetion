@@ -22,7 +22,13 @@ def generate_launch_description():
                 'output_dir': 'pvt_out',
                 'output_prefix': 'pvt_split',
                 'cmd_history_window_s': 2.0,
-                'stall_timeout_s': 2.0,
+                
+                # Safty limits
+                'translation_speed_limit_mps': 0.15,
+                'rotation_speed_limit_dp': 10.0,
+                'translation_step_limit_m': 0.0007,  # Effectively 0.07 m/s (100 Hz control frequency so *100)
+                'rotation_step_limit_deg': 0.1,
+                'stall_timeout_s': 0.5,
             }],
         ),
     ])

@@ -97,5 +97,8 @@ RUN echo "source /opt/ros/humble/setup.bash" >> /home/${USERNAME}/.bashrc && \
 # Switch to the non-root user
 USER ${USERNAME}
 
+
+RUN pip3 install pupil-apriltags
+
 # Default command to run at startup (Must be at the very bottom)
 CMD ["bash"]

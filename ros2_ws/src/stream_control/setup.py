@@ -30,7 +30,6 @@ setup(
         'console_scripts': [
             'trajectory_generator_node = stream_control.trajectory_generator_node:main',
             'stream_control_node = stream_control.stream_control_node:main',
-            'z_force_controller_node = stream_control.z_force_controller_node:main',
             'spiral_search_control_node = stream_control.spiral_search_control_node:main',
         ],
     },

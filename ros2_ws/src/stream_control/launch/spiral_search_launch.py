@@ -4,6 +4,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
+        # Spiral search controller
         Node(
             package = 'stream_control',
             executable='spiral_search_control_node',
@@ -20,10 +21,11 @@ def generate_launch_description():
                 'command_service': 'pvt_command',
                 'service_wait_log_period_s': 2.0,
 
-                'spiral_pitch_mm': 0.5,
+                'spiral_pitch_mm': 3.0,
                 'spiral_max_radius_mm': 50.0,
-                'spiral_search_speed_mm_s': 3.0,
+                'spiral_search_speed_mm_s': 30.0,
 
+                'hole_testing_threshold_mm': 3,
                 'touch_force_tol_n': 0.3,
                 'align_force': 0.3,
                 'insert_force': 6.0,
@@ -31,4 +33,5 @@ def generate_launch_description():
 
             }],
         ),
+        
     ])

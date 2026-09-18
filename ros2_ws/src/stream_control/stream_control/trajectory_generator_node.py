@@ -6,7 +6,7 @@ Trajectory generator node for TM PVT streaming control.
 Responsibilities
 -----------------
 - Wait for one FeedbackState message to capture the starting tool pose.
-- Pre-generate the complete Z trajectory (all positions) from a
+- Pre-generate the complete X trajectory (all positions) from a
   ZTrajectoryProvider (e.g. SineZTrajectory), exactly like the original
   pvt_sine_wave_online.py.
 - Stream the trajectory one point at a time, at ctrl_hz, as PVTCommand
@@ -41,43 +41,43 @@ from custom_interface.srv import PVTCommand
 # ---------------------------------------------------------------------------
 # Trajectory providers (same interface/logic as pvt_sine_wave_online.py)
 # ---------------------------------------------------------------------------
-class ZTrajectoryProvider:
-    """Interface for reusable Z-axis stream trajectories."""
-    name = "z_trajectory"
+class XTrajectoryProvider:
+    """Interface for reusable X-axis stream trajectories."""
+    name = "x_trajectory"
 
     def build(self, start_pose_6d: List[float], ctrl_dt: float, total_points: int) -> List[float]:
         raise NotImplementedError
 
 
 @dataclass
-class SineZTrajectory(ZTrajectoryProvider):
+class SineXTrajectory(XTrajectoryProvider):
     """Default sine trajectory used by the original online script."""
     amp_m: float = 0.05
     period_s: float = 2.0
     phase_rad: float = 0.0
-    name: str = "sine_z"
+    name: str = "sine_x"
 
     def build(self, start_pose_6d: List[float], ctrl_dt: float, total_points: int) -> List[float]:
         omega = 2.0 * math.pi / self.period_s
-        z0 = start_pose_6d[2]
+        x0 = start_pose_6d[0]
         return [
-            z0 + self.amp_m * math.sin(omega * k * ctrl_dt + self.phase_rad)
+            x0 + self.amp_m * math.sin(omega * k * ctrl_dt + self.phase_rad)
             for k in range(total_points)
         ]
 
 
 @dataclass
-class ListZTrajectory(ZTrajectoryProvider):
-    """Trajectory provider for a user-supplied list of relative or absolute Z points."""
-    z_points_m: List[float]
+class ListXTrajectory(XTrajectoryProvider):
+    """Trajectory provider for a user-supplied list of relative or absolute X points."""
+    x_points_m: List[float]
     relative_to_start: bool = True
     name: str = "list_z"
 
     def build(self, start_pose_6d: List[float], ctrl_dt: float, total_points: int) -> List[float]:
-        if not self.z_points_m:
-            raise ValueError("z_points_m must contain at least one point")
-        z0 = start_pose_6d[2] if self.relative_to_start else 0.0
-        out = [z0 + z for z in self.z_points_m[:total_points]]
+        if not self.x_points_m:
+            raise ValueError("x_points_m must contain at least one point")
+        x0 = start_pose_6d[0] if self.relative_to_start else 0.0
+        out = [x0 + x for x in self.x_points_m[:total_points]]
         if len(out) < total_points:
             out.extend([out[-1]] * (total_points - len(out)))
         return out
@@ -86,6 +86,8 @@ class ListZTrajectory(ZTrajectoryProvider):
 class TrajectoryGeneratorNode(Node):
     def __init__(self):
         super().__init__("pvt_trajectory_generator")
+
+        self.PVT_SERVER_CLIENT_ID = "TrajectoryGeneratorNode"
 
         # ----- parameters -----
         self.declare_parameter("ctrl_hz", 100.0)
@@ -110,8 +112,8 @@ class TrajectoryGeneratorNode(Node):
         self.ctrl_dt = 1.0 / self.ctrl_hz
         self.total_points = int(round(self.duration_s * self.ctrl_hz))
 
-        # Swap this out (or make it a plugin param) for ListZTrajectory etc.
-        self.trajectory: ZTrajectoryProvider = SineZTrajectory(
+        # Swap this out (or make it a plugin param) for ListXTrajectory etc.
+        self.trajectory: XTrajectoryProvider = SineXTrajectory(
             amp_m=float(self.get_parameter("amp_m").value),
             period_s=float(self.get_parameter("period_s").value),
             phase_rad=float(self.get_parameter("phase_rad").value),
@@ -124,8 +126,8 @@ class TrajectoryGeneratorNode(Node):
 
         self.has_feedback = False
         self.start_pose_6d: Optional[List[float]] = None
-        self.trajectory_z: Optional[List[float]] = None
-        self.z_prev: Optional[float] = None
+        self.trajectory_x: Optional[List[float]] = None
+        self.x_prev: Optional[float] = None
         self.tick = 0
         self.done = False
 
@@ -156,7 +158,7 @@ class TrajectoryGeneratorNode(Node):
                 math.degrees(float(msg.tool_pose[5])),
             ]
             self.has_feedback = True
-            self.get_logger().info(f"✓ start pose captured: Z={self.start_pose_6d[2]:.4f}")
+            self.get_logger().info(f"✓ start pose captured: X={self.start_pose_6d[0]:.4f}, Y={self.start_pose_6d[1]:.4f}, Z={self.start_pose_6d[2]:.4f}")
 
     def _startup_tick(self):
         if not self.has_feedback or self.start_pose_6d is None:
@@ -173,10 +175,10 @@ class TrajectoryGeneratorNode(Node):
 
         self.startup_timer.cancel()
 
-        self.trajectory_z = self.trajectory.build(
+        self.trajectory_x = self.trajectory.build(
             self.start_pose_6d, self.ctrl_dt, self.total_points
         )
-        self.get_logger().info(f"✓ pre-generated {len(self.trajectory_z)} trajectory points")
+        self.get_logger().info(f"✓ pre-generated {len(self.trajectory_x)} trajectory points")
         self.get_logger().info("✓ PVTCommand service is up")
 
         self.ctrl_timer = self.create_timer(self.ctrl_dt, self._ctrl_tick)
@@ -191,31 +193,33 @@ class TrajectoryGeneratorNode(Node):
                 self.get_logger().info("=== TRAJECTORY STREAM END ===")
             return
 
-        z_current = self.trajectory_z[self.tick]
+        x_current = self.trajectory_x[self.tick]
 
         # Velocity from position difference (not analytical formula) --
         # this node only ever looks at "current & previous point".
         if self.tick == 0:
-            vz = 0.0
+            vx = 0.0
         else:
-            vz = (z_current - self.z_prev) / self.ctrl_dt
-        self.z_prev = z_current
+            vx = (x_current - self.x_prev) / self.ctrl_dt
+        self.x_prev = x_current
 
         req = PVTCommand.Request()
         req.header.stamp = self.get_clock().now().to_msg()
+        req.client_id = self.PVT_SERVER_CLIENT_ID
+        
         req.tick = self.tick
         req.is_last = (self.tick == self.total_points - 1)
 
-        req.x_m = self.start_pose_6d[0]
+        req.x_m = x_current
         req.y_m = self.start_pose_6d[1]
-        req.z_m = z_current
+        req.z_m = self.start_pose_6d[2]
         req.rx_deg = self.start_pose_6d[3]
         req.ry_deg = self.start_pose_6d[4]
         req.rz_deg = self.start_pose_6d[5]
 
-        req.vx_mps = 0.0
+        req.vx_mps = vx
         req.vy_mps = 0.0
-        req.vz_mps = vz
+        req.vz_mps = 0.0
         req.wx_dps = 0.0
         req.wy_dps = 0.0
         req.wz_dps = 0.0
@@ -242,10 +246,12 @@ class TrajectoryGeneratorNode(Node):
 
         future.add_done_callback(_done_cb)
 
+        '''
         if self.tick % 10 == 0:
             self.get_logger().info(
-                f"[GEN {self.tick:03d}] z={z_current:.4f} vz={vz:+.3f} inflight={self._inflight}"
+                f"[GEN {self.tick:03d}] x={x_current:.4f} vx={vx:+.3f} inflight={self._inflight}"
             )
+        '''
 
         self.tick += 1
 

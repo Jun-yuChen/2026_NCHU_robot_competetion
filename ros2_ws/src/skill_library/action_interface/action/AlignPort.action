@@ -1,0 +1,10 @@
+# Goal -- empty. The target port is fixed inside arm_cmd_cycle2 for now
+# (TARGET_PORT, hardcoded to usb3), not passed in here. Add a goal field
+# once something upstream actually needs to choose the port per call.
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string status

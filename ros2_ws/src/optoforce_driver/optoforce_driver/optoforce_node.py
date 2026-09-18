@@ -22,12 +22,46 @@ counts轉N/Nm的係數是這顆感測器(序號ICE042)出廠校正報告
 
 用法：
     ros2 run optoforce_driver optoforce_node --ros-args -p port:=/dev/ttyACM0
+
+歸零介面(給其他node呼叫)：
+    std_srvs/Trigger service，其他node呼叫 optoforce/zero，這通call會
+    block到offset重新收集真的完成(或逾時)才回傳，response.success +
+    response.message("SENSOR_OK"/"SENSOR_TIMEOUT: ...")。沒有用action，
+    因為這個操作不需要cancel或進度feedback，單純blocking call/response
+    就夠——但底層還是需要跟action版一樣的thread-safe handoff，因為
+    「送出歸零指令」跟「offset重新收集完成」中間隔了offset_samples筆
+    封包的時間，service callback不能用忙等或跨thread直接讀旗標的方式
+    等它完成。
+
+    Thread model: _poll()是唯一會寫_history/_offset/_offset_buffer/
+    _offset_ready的地方(timer callback thread，MutuallyExclusiveCallbackGroup)。
+    service的_zero_callback(ReentrantCallbackGroup，跑在MultiThreadedExecutor
+    底下的另一個thread)不直接碰這些欄位，只透過兩個thread-safe的Queue
+    跟_poll溝通：
+      - _zero_request_q: _zero_callback丟"該歸零了"進去，_poll在下一次
+        poll開頭撈出來才真的送歸零指令+重置狀態(重置動作留在寫者自己
+        的thread裡做，不跨thread碰共享狀態)。
+      - _zero_done_q: _accumulate_offset收滿新offset後，如果這次重新收集
+        是由service觸發的(_zero_pending_ack)，才把樣本數丟進這個queue。
+        _zero_callback對它做get(timeout=...)——這個block是安全的，因為
+        _poll在另一個thread繼續跑，不是忙等同一個thread的旗標。逾時就
+        回傳SENSOR_TIMEOUT。
+    node開機時的第一次歸零(__init__裡呼叫)不會經過_zero_pending_ack，
+    所以不會誤觸發_zero_done_q，也不會留殘留樣本讓下一次真正的service
+    請求撈到舊的完成信號。
+
+    注意：service callback會被佔用最多zero_timeout_sec秒(預設同時只能
+    處理一個歸零請求)，MultiThreadedExecutor的thread數要夠(至少2個)，
+    否則等待期間會排擠其他callback(包括_poll，如果group沒分開的話)。
 """
+import queue
 import struct
 import time
 from collections import deque
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from geometry_msgs.msg import WrenchStamped
 from std_srvs.srv import Trigger
@@ -51,10 +85,14 @@ class OptoForceNode(Node):
 
         self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('frame_id', 'optoforce_sensor')
-        self.declare_parameter('filter_window', 30)
+        self.declare_parameter('filter_window', 10)
         self.declare_parameter('offset_samples', 100)
+        self.declare_parameter('zero_timeout_sec', 5.0)
+
         port = self.get_parameter('port').get_parameter_value().string_value
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        self.zero_timeout_sec = self.get_parameter(
+            'zero_timeout_sec').get_parameter_value().double_value
 
         window = self.get_parameter('filter_window').get_parameter_value().integer_value
         if window < 1:
@@ -63,85 +101,116 @@ class OptoForceNode(Node):
         self.filter_window = window
         self._axes = ('fx', 'fy', 'fz', 'tx', 'ty', 'tz')
         # 每軸各自一個deque，maxlen=window，超出視窗的舊樣本會自動被擠掉。
-        # 用moving average是為了平滑高頻雜訊，不是為了濾除感測器過載這種
-        # 真實的力值變化，所以window不要設太大，不然力訊號會被拖慢。
         self._history = {axis: deque(maxlen=self.filter_window) for axis in self._axes}
 
-        # 軟體offset：硬體歸零(_send_zero_command)之外再加一層，開機後
-        # 收前N筆原始讀值取平均當offset，之後每筆讀值都先減掉這個offset
-        # 再進moving average濾波。offset_samples<=0代表關閉這個機制，
-        # offset直接視為0(等於不做軟體歸零，只靠硬體歸零)。
+        # 軟體offset：硬體歸零之外再加一層，開機後收前N筆原始讀值取平均
+        # 當offset，之後每筆讀值都先減掉這個offset再進moving average濾波。
         offset_samples = self.get_parameter('offset_samples').get_parameter_value().integer_value
         self.offset_samples = max(offset_samples, 0)
         self._offset = {axis: 0.0 for axis in self._axes}
         self._offset_buffer = {axis: [] for axis in self._axes}
         self._offset_ready = (self.offset_samples == 0)
 
+        # --- 歸零介面用的thread-safe handoff ---
+        # _poll()(timer thread)是唯一寫入者；action的execute_callback
+        # (另一個thread)只丟request/等done，不直接碰上面那些欄位。
+        self._zero_request_q = queue.Queue()
+        self._zero_done_q = queue.Queue()
+        # 只有「這次的offset重新收集是action觸發的」才需要通知done queue，
+        # 避免開機那次歸零也誤觸發它，或把上一次的殘留完成信號被下一次
+        # 請求撈走。這個旗標只在_poll thread裡讀寫。
+        self._zero_pending_ack = False
+
         self.get_logger().info(f'開啟序列埠 {port} (1000000 baud)...')
-        # timeout=0 -> 非阻塞讀取，read()立刻回傳目前有的資料(可能是空的)，
-        # 不會卡住ROS2的timer callback。
         self.ser = serial.Serial(port, baudrate=1_000_000, timeout=0)
 
-        # ⚠️ 感測器的歸零設定斷電就會重置(協定文件明講)，這支driver每次
-        # 開機都是回到原始未歸零基準——Fz的校正係數只有4.09 counts/N
-        # (比Fx/Fy粗糙近10倍)，同樣的未歸零基準值換算到Fz上看起來會被
-        # 放大近10倍，容易誤以為是解析錯誤。開機時自動送一次硬體歸零，
-        # Speed/Filter維持出廠預設(100Hz/15Hz)不變。
-        # 送這道指令的當下感測器不能受力，不然歸零基準會歪掉。
+        # ⚠️ 感測器的歸零設定斷電就會重置，這支driver每次開機都是回到
+        # 原始未歸零基準——開機時自動送一次硬體歸零。
         time.sleep(0.2)  # 給序列埠一點時間穩定，避免第一個bytes遺失
         self._send_zero_command()
 
         self.pub = self.create_publisher(WrenchStamped, 'optoforce/wrench', 10)
         self._buffer = bytearray()
 
-        # 讓外部可以隨時觸發重新歸零，不用重開整個node——序列埠同一時間
-        # 只能被一個process開著，所以不能做成另一支獨立腳本直接連序列埠，
-        # 只能透過已經握有序列埠的這個node自己提供service。
-        # 用法: ros2 service call /optoforce/zero std_srvs/srv/Trigger {}
-        self.zero_srv = self.create_service(Trigger, 'optoforce/zero', self._zero_callback)
+        # timer跟service分屬不同callback group，且main()用MultiThreadedExecutor，
+        # 讓_zero_callback可以在等_zero_done_q時，_poll仍能繼續在另一個
+        # thread跑，不會互相卡住。
+        self._poll_group = MutuallyExclusiveCallbackGroup()
+        self._zero_group = ReentrantCallbackGroup()
+
+        self.zero_srv = self.create_service(
+            Trigger, 'optoforce/zero', self._zero_callback,
+            callback_group=self._zero_group,
+        )
 
         # 感測器預設100Hz持續傳送，用200Hz輪詢確保不漏包。
-        self.timer = self.create_timer(1.0 / 200.0, self._poll)
+        self.timer = self.create_timer(
+            1.0 / 200.0, self._poll, callback_group=self._poll_group)
 
     def _send_zero_command(self, speed: int = 10, filt: int = 4):
         """送9-byte CONFIGURATION封包觸發硬體歸零(ZERO=255)，Speed=10
-        (100Hz)、Filter=4(15Hz cutoff)維持出廠預設值不變，只是把它們
-        重新寫一次(協定要求Speed/Filter/Zero一起送)。
+        (100Hz)、Filter=4(15Hz cutoff)維持出廠預設值不變。
         Checksum = 170+0+50+3+Speed+Filter+Zero (取UINT16)。
         """
-        # Send zero = 0 first
-        '''
-        zero = 0
-        checksum = (170 + 0 + 50 + 3 + speed + filt + zero) & 0xFFFF
-        packet = bytes([170, 0, 50, 3, speed, filt, zero]) + struct.pack('>H', checksum)
-        self.ser.write(packet)
-        '''
-
         time.sleep(0.5)
-
-        # Send zero command
         zero = 255
         checksum = (170 + 0 + 50 + 3 + speed + filt + zero) & 0xFFFF
         packet = bytes([170, 0, 50, 3, speed, filt, zero]) + struct.pack('>H', checksum)
         self.ser.write(packet)
         self.get_logger().info('已送出歸零指令')
 
-    def _zero_callback(self, request, response):
+    def _drain_zero_requests(self):
+        """在_poll開頭呼叫。只在timer thread裡執行，所以底下這些狀態
+        重置動作不需要lock。這是_zero_request_q唯一的消費端。"""
+        try:
+            self._zero_request_q.get_nowait()
+        except queue.Empty:
+            return
+
         self._send_zero_command()
         # 歸零基準改變了，濾波視窗跟軟體offset裡殘留的舊樣本都是用舊
-        # 基準算出來的，混進新基準的樣本會讓歸零後的前幾筆輸出出現
-        # 過渡性的錯誤值，所以歸零時把兩者都清空重新累積。
+        # 基準算出來的，一律清空重新累積。
         for h in self._history.values():
             h.clear()
         for axis in self._axes:
             self._offset[axis] = 0.0
             self._offset_buffer[axis].clear()
         self._offset_ready = (self.offset_samples == 0)
+        self._zero_pending_ack = True
+
+        if self._offset_ready:
+            # offset_samples設成0(關閉軟體offset)，沒有樣本要收集，
+            # 立刻視為完成。
+            self._zero_pending_ack = False
+            self._zero_done_q.put(0)
+
+    def _zero_callback(self, request, response):
+        # 先清掉done queue裡任何殘留項目(理論上不該有，但避免萬一撈到
+        # 不屬於這次請求的舊完成信號)。
+        while True:
+            try:
+                self._zero_done_q.get_nowait()
+            except queue.Empty:
+                break
+
+        self._zero_request_q.put(True)
+
+        try:
+            samples = self._zero_done_q.get(timeout=self.zero_timeout_sec)
+        except queue.Empty:
+            response.success = False
+            response.message = (
+                f'SENSOR_TIMEOUT: 歸零指令已送出，但offset重新收集在'
+                f'{self.zero_timeout_sec:.1f}秒內未完成')
+            return response
+
         response.success = True
-        response.message = '已送出歸零指令(感測器歸零瞬間不能受力)'
+        response.message = f'SENSOR_OK (samples_collected={samples})'
         return response
 
     def _poll(self):
+        self._drain_zero_requests()
+
         n = self.ser.in_waiting
         if n:
             self._buffer += self.ser.read(n)
@@ -149,15 +218,13 @@ class OptoForceNode(Node):
         while True:
             idx = self._buffer.find(HEADER)
             if idx < 0:
-                # 沒找到header，只留最後3 bytes(可能是header被從中截斷)，
-                # 避免雜訊資料讓buffer無限長大。
                 if len(self._buffer) > 3:
                     del self._buffer[:-3]
                 return
             if idx > 0:
-                del self._buffer[:idx]  # 丟掉header前面的雜訊/上一包的殘餘
+                del self._buffer[:idx]
             if len(self._buffer) < PACKET_LEN:
-                return  # 這包還沒收完整，等下一次poll再湊
+                return
 
             packet = bytes(self._buffer[:PACKET_LEN])
             del self._buffer[:PACKET_LEN]
@@ -171,8 +238,6 @@ class OptoForceNode(Node):
                 f'checksum不符(算出{checksum_calc}, 收到{checksum_recv})，丟棄這包')
             return
 
-        # packet[4:6]=sample counter, packet[6:8]=status(過載/感測器錯誤，
-        # 見協定文件STATUS章節)，目前沒用到，之後要判斷過載可以在這裡加。
         fx, fy, fz, tx, ty, tz = struct.unpack('>6h', packet[8:20])
 
         raw = {
@@ -184,12 +249,12 @@ class OptoForceNode(Node):
 
         if not self._offset_ready:
             self._accumulate_offset(raw)
-            return  # 還在收集offset樣本，這幾包直接丟棄不publish
+            return
 
         debiased = {axis: raw[axis] - self._offset[axis] for axis in self._axes}
         filtered = self._apply_moving_average(debiased)
         if filtered is None:
-            return  # 視窗還沒填滿(開機/剛歸零後)，先不publish
+            return
 
         msg = WrenchStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -204,7 +269,8 @@ class OptoForceNode(Node):
 
     def _accumulate_offset(self, raw: dict):
         """收集開機(或剛歸零)後的前offset_samples筆原始讀值，湊滿後
-        取平均當成軟體offset，之後每筆讀值都會先減掉它。"""
+        取平均當成軟體offset。若這次收集是action觸發的(_zero_pending_ack)，
+        完成時把樣本數丟進_zero_done_q通知等待中的execute_callback。"""
         for axis in self._axes:
             self._offset_buffer[axis].append(raw[axis])
 
@@ -220,12 +286,11 @@ class OptoForceNode(Node):
             f'offset收集完成({self.offset_samples}筆)：' +
             ', '.join(f'{axis}={self._offset[axis]:.4f}' for axis in self._axes))
 
+        if self._zero_pending_ack:
+            self._zero_pending_ack = False
+            self._zero_done_q.put(self.offset_samples)
+
     def _apply_moving_average(self, raw: dict):
-        """對6軸各自套用簡單移動平均。所有軸共用同一個累積節奏(每包
-        一起append)，所以只要檢查其中一軸的deque長度就知道視窗是否
-        填滿。視窗還沒填滿時(開機/剛歸零後的前幾包)回傳None，
-        呼叫端據此丟棄不publish，避免用不足window的樣本數算出的
-        平均值當成正式輸出。"""
         out = {}
         for axis, value in raw.items():
             h = self._history[axis]
@@ -241,8 +306,12 @@ class OptoForceNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = OptoForceNode()
+    # 至少2個thread：timer(_poll)跟action execute_callback要能同時跑，
+    # execute_callback才不會在等_zero_done_q時卡住_poll。
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

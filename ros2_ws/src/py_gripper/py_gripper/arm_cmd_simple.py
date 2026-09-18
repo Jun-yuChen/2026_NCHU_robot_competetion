@@ -15,6 +15,8 @@ import time
 # move 0.2 -0.3 0.19
 # place
 
+GRIPPER_ORIENTATION = [1.57, 0.0, 1.57]
+
 class ArmCmdSimple(Node):
     def __init__(self, node_name='arm_cmd_simple'):
         super().__init__(node_name)
@@ -30,8 +32,8 @@ class ArmCmdSimple(Node):
 
         self.set_positions_req = SetPositions.Request()
         self.set_event_req = SetEvent.Request()
-        self.target_positions = [0.2, -0.4, 0.35, 3.14159, 0.0, -1.57]
-        self.current_positions = [0.2, -0.4, 0.35, 3.14159, 0.0, -1.57]
+        self.target_positions = [0.2, -0.4, 0.35, 1.57, 0.0, 1.57]
+        self.current_positions = [0.2, -0.4, 0.35, 1.57, 0.0, 1.57]
         
     def pos_callback(self,msg):
         self.current_positions = msg.tool_pose
@@ -42,7 +44,7 @@ class ArmCmdSimple(Node):
             return False
         return True
 
-    def set_position(self,positions=[0.2, -0.4, 0.35, 3.14159, 0.0, -1.57], velocity=0.1, acc_time=0.5, blend_percentage=100, fine_goal=False):
+    def set_position(self,positions=[0.2, -0.4, 0.35, 1.57, 0.0, 1.57], velocity=0.1, acc_time=0.5, blend_percentage=100, fine_goal=False):
         
         self.target_positions = positions
         print(self.target_positions)
@@ -106,11 +108,11 @@ def main(args=None):
 
         if len(positions) == 3:
             gripper = None
-            positions = positions + [3.14159, 0.0, 3.14]
+            positions = positions + GRIPPER_ORIENTATION
 
         elif len(positions) == 4:
             gripper = positions[3]
-            positions = positions[:3] + [3.14159, 0.0, 3.14]
+            positions = positions[:3] + GRIPPER_ORIENTATION
 
         elif len(positions) == 6:
             gripper = None

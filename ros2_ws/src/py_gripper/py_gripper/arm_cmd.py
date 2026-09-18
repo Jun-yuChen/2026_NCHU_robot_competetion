@@ -3,27 +3,67 @@ import rclpy.time_source
 from tm_msgs.srv import SetPositions,SetEvent,SetIO
 from tm_msgs.msg import FeedbackState
 from geometry_msgs.msg import PoseStamped
-
-import json
-import os
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
 import rclpy
 from rclpy.node import Node
-from ament_index_python.packages import get_package_share_directory
-import numpy as np
 from scipy.spatial.transform import Rotation
+import numpy as np
 import threading
 import time
+import json
+import os
 
-# Geometry of the RJ45 jig, measured from objects/rj45_test/rj45_test.obj after
-# recentring (see fp_pose_bridge / track_publish_and_stream): the socket opening
-# sits on the +Z face, 15.2mm along X by 12.2mm along Y, its centre offset +2mm
-# in Y from the jig centre. Mesh +Z points *out* of the hole, i.e. the direction
-# a plug approaches from -- and the flange's +Z points the opposite way (down,
-# toward the work), so aligning means flange Z anti-parallel to object Z.
-HOLE_CENTRE_IN_MESH = np.array([0.0, 0.002, 0.010])
-HOLE_LONG_AXIS_IN_MESH = np.array([1.0, 0.0, 0.0])   # 15.2mm side runs along X
-HOLE_NORMAL_IN_MESH = np.array([0.0, 0.0, 1.0])      # +Z, pointing out of the hole
+# Where "save"/"back" park a single remembered pose (e.g. a standard
+# observation stance to measure holes from consistently -- see the
+# discussion on hand-eye residual error depending on viewing distance/angle).
+# Outside install/ and src/ on purpose: install gets overwritten by every
+# colcon build, and this is runtime scratch, not something to version-control.
+SAVED_POSE_PATH = os.path.expanduser('~/.py_gripper_saved_pose.json')
+
+# hover_at()'s default tool-tip distance, ruler-measured from G (the point
+# tool_pose/current_positions actually reports, NOT the raw mechanical
+# flange -- on this rig G sits 4.425cm further out along Z than the flange
+# itself, confirmed against the teach pendant's own TCP setting) -- see
+# that method's own docstring for why it must be measured from G, not the
+# camera. Update this if the held connector changes length; "above" still
+# takes an explicit second number to override it for one call without
+# editing code.
+DEFAULT_TIP_OFFSET_CM = 16.99  # measured directly from G, 2026-09-10
+
+# Empirically observed systematic offset: the arm consistently lands
+# too high relative to where each hole actually is, checked across
+# several different ports -- confirmed live 2026-09-10. A fixed,
+# same-direction offset across unrelated ports is what a correctable
+# systematic bias looks like (independent per-hole measurement noise
+# would not agree in direction and size like that).
+# Confirmed to be the WORLD FRAME's own Z axis specifically, by directly
+# nudging one absolute-position coordinate at a time and watching which
+# one moved the debug view up/down on screen -- not assumed from the
+# panel's own measured orientation or any other derived axis. Re-measure
+# and update this if it stops holding once other accuracy work
+# (K/distortion, T_G_E, etc.) changes the picture -- this is a patch
+# over today's residual, not a derived constant.
+#
+# usb1/usb2 measured 2.5mm; every other port measured 1mm more (3.5mm) --
+# confirmed live 2026-09-15. Not assumed to generalise to ports not yet
+# tested; a newly added port defaults to Z_BIAS_M_OTHER until it gets its
+# own measurement.
+Z_BIAS_M_USB12 = 0.0025       # usb1, usb2
+Z_BIAS_M_OTHER = 0.0025       # every other port
+_Z_BIAS_USB12_PORTS = ('usb1', 'usb2')
+
+
+def _z_bias_for(port_name):
+    return Z_BIAS_M_USB12 if port_name in _Z_BIAS_USB12_PORTS else Z_BIAS_M_OTHER
+
+
+# World-frame Y axis, same convention as the Z bias above (confirmed axis/
+# direction, not derived). Same correction for every port for now -- unlike
+# Z, not yet split per-port. Starting value, not yet tuned per port.
+Y_BIAS_M = 0.001 # -Y direction, all ports
+
 # 0.34 -0.47 0.19 target
 # move 0.34 -0.47 0.3
 # move 0.34 -0.47 0.19
@@ -34,14 +74,22 @@ HOLE_NORMAL_IN_MESH = np.array([0.0, 0.0, 1.0])      # +Z, pointing out of the h
 # place
 
 class ArmCmd(Node):
-    def __init__(self):
-        super().__init__('arm_cmd')
+    def __init__(self, node_name='arm_cmd'):
+        # node_name overridable so a second ArmCmd-based process (e.g. an
+        # action server) can run alongside the interactive `arm_cmd` CLI
+        # without a node-name collision on the same ROS domain.
+        super().__init__(node_name)
         self.pos_cli = self.create_client(SetPositions, 'set_positions')
         self.event_cli = self.create_client(SetEvent, 'set_event')
         self.io_cli = self.create_client(SetIO, 'set_io')
         self.pos_sub = self.create_subscription(FeedbackState, 'feedback_states', self.pos_callback, 10)
         self.latest_object_pose = None
+        self._current_target_port = None  # for _target_xyz's per-port Z bias
         self.object_pose_sub = self.create_subscription(PoseStamped, 'world_frame/object_pose', self.object_pose_callback, 10)
+        # not waited-for at startup -- depth_pose_node may not be up yet (or
+        # this session may not need it at all), so only block on it lazily,
+        # inside set_target_port itself, when the user actually asks for it.
+        self.set_param_cli = self.create_client(SetParameters, '/depth_pose_node/set_parameters')
         while not self.pos_cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('service not available, waiting again...')
         while not self.event_cli.wait_for_service(timeout_sec=1.0):
@@ -50,47 +98,9 @@ class ArmCmd(Node):
             self.get_logger().info('service not available, waiting again...')
         self.set_positions_req = SetPositions.Request()
         self.set_event_req = SetEvent.Request()
-        self.declare_parameter('part', 'rj45_test')
-        # Height of the bench top in world/base coordinates. The arm reports
-        # tool_pose against its own base frame, and nothing in the driver knows
-        # where the table is, so the one command that is specified relative to
-        # the table has to be told. Measured on this rig: the bench sits 5cm
-        # above the robot base. Override with -p table_z:=... if the arm is
-        # remounted or moved to another bench.
-        self.declare_parameter('table_z', 0.05)
-        # Roll added automatically for each kind of plug. The alignment code
-        # squares the flange's X axis to the socket's long axis, which puts the
-        # jaws in the right plane but not necessarily the right way up: how far
-        # they then have to turn depends on how that particular plug sits
-        # between them, and an RJ45 body does not sit the way a flat USB or
-        # HDMI one does. Measured on this rig, USB and HDMI need a quarter turn
-        # and RJ45 needs none, which is why this is per kind rather than one
-        # constant -- an earlier version used a single global offset and was
-        # wrong for RJ45 by 90 deg.
-        #
-        # Sign: positive roll increases the target's rz, a counter-clockwise
-        # turn seen from above. Note +90 and -90 both leave the jaws parallel to
-        # the socket -- a long axis is a line, not a direction -- and differ
-        # only in which way round the plug ends up, so if one turns out to be
-        # facing backwards on first insertion, negate that kind's value.
-        # Height of the part standing on the bench, when it differs from the CAD.
-        # Only the clearance readout in descend() uses this -- nothing about
-        # targeting a port depends on it, because the port's z offset appears
-        # identically in the PnP object points and in the arm's hole_pos sum and
-        # cancels out. But a clearance number that is optimistic is the wrong
-        # kind of wrong, so it is worth being able to correct when the hardware
-        # is shimmed or rebuilt taller than the model. 0.0 means "use the CAD".
-        self.declare_parameter('part_height_m', 0.0)
-        self.declare_parameter('roll_usb', 90.0)
-        self.declare_parameter('roll_hdmi', 90.0)
-        self.declare_parameter('roll_rj45', 0.0)
-        # for the single-opening jig, which has no port table and so no kind
-        self.declare_parameter('roll_default', 0.0)
-        self.part = self.get_parameter('part').value
-        self._ports = None
         self.target_positions = [0.2, -0.4, 0.35, 3.14159, 0.0, -1.57]
         self.current_positions = [0.2, -0.4, 0.35, 3.14159, 0.0, -1.57]
-        
+
     def pos_callback(self,msg):
         self.current_positions = msg.tool_pose
         # self.get_logger().info("Current Position: %s" % self.current_positions)
@@ -111,283 +121,387 @@ class ArmCmd(Node):
                 return False
         return True
 
-    def descend(self, drop=0.05, move=True):
-        """Straight vertical move: keep X/Y and orientation, only lower Z.
-
-        Does not touch the tracked object pose at all, so it is the one motion
-        that behaves identically whether or not vision has a lock.
-
-        The log line reports what will be left underneath rather than refusing
-        anything. Descending is the direction that can hit something, and the
-        useful thing to know before committing is the remaining clearance --
-        both to the bench and to the top of the part standing on it. Note that
-        clearance is measured to the tool_pose the driver reports, so whatever
-        is held in the jaws hangs below the number shown.
-        """
-        target = list(self.current_positions[:6])
-        target[2] -= drop
-        if not self.target_is_sane(target):
+    def _set_remote_param(self, name, value):
+        # Shared by anything that drives depth_pose_node's own parameters
+        # through its standard set_parameters service, so they can be changed
+        # from here without a separate `ros2 param set` terminal or
+        # restarting depth_pose_node. bool/str inferred from value's type.
+        if not self.set_param_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn('depth_pose_node not reachable (set_parameters service unavailable) -- is it running?')
             return None
-        table_z = float(self.get_parameter('table_z').value)
-        part_h = float(self.get_parameter('part_height_m').value)
-        source = 'measured'
-        if part_h <= 0.0:
-            source = 'CAD'
-            try:
-                part_h = float(json.load(open(os.path.join(
-                    get_package_share_directory('py_gripper'), 'config',
-                    'opening_reference.json')))[self.part].get('work_height_m', 0.0))
-            except (OSError, KeyError, ValueError, TypeError):
-                part_h = 0.0
-        above_table = target[2] - table_z
-        note = f'{above_table*100:.1f}cm above the bench'
-        if part_h > 0:
-            note += (f', {(above_table - part_h)*100:.1f}cm above the part '
-                     f'({part_h*100:.1f}cm tall, {source})')
-        self.get_logger().info(
-            f'descend {drop*100:.0f}cm straight down -> '
-            f'{[round(v, 4) for v in target]}  ({note})')
-        if not move:
-            self.get_logger().info('(dry run, not moving)')
-            return None
-        return self.send_request(target)
-
-    def ready_pose(self, height=0.45, move=True):
-        """Park the flange `height` above the table, its face parallel to it.
-
-        The starting pose for a run. Two things are being set: the height, and
-        the flange plane -- "parallel to the table" means the flange's own Z
-        axis points straight down, which is the same convention every other
-        command in this file uses (euler xyz of pi, 0, heading).
-
-        The heading is deliberately left alone. Levelling the flange does not
-        require picking a yaw, and carrying the current one over keeps this to
-        the smallest motion that satisfies the request; the alignment commands
-        set the heading themselves when they run.
-
-        Height is measured from the `table_z` parameter, not from z=0, because
-        the arm's base frame is not the table. It is also measured to the
-        *tool_pose* the driver reports -- if a TCP offset is configured in
-        TMflow, that is the point being placed 40cm up, not the flange face,
-        and anything held in the jaws hangs below it.
-        """
-        table_z = float(self.get_parameter('table_z').value)
-
-        # level the flange while keeping whatever heading it already has
-        R_current = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()
-        flange_z = np.array([0.0, 0.0, -1.0])
-        flange_x = R_current[:, 0].copy()
-        flange_x[2] = 0.0
-        n = np.linalg.norm(flange_x)
-        if n < 1e-6:
-            # the flange's X currently points straight up or down, so there is
-            # no heading to preserve -- any horizontal one will do
-            flange_x = np.array([1.0, 0.0, 0.0])
+        if isinstance(value, bool):
+            pval = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=value)
         else:
-            flange_x /= n
-        flange_y = np.cross(flange_z, flange_x)
-        R_target = np.column_stack([flange_x, flange_y, flange_z])
-        rx, ry, rz = Rotation.from_matrix(R_target).as_euler('xyz')
-
-        target = [float(self.current_positions[0]),
-                  float(self.current_positions[1]),
-                  float(table_z + height),
-                  float(rx), float(ry), float(rz)]
-        if not self.target_is_sane(target):
+            pval = ParameterValue(type=ParameterType.PARAMETER_STRING, string_value=value)
+        req = SetParameters.Request()
+        req.parameters = [Parameter(name=name, value=pval)]
+        future = self.set_param_cli.call_async(req)
+        for _ in range(100):
+            if future.done():
+                break
+            time.sleep(0.05)
+        if not future.done():
+            self.get_logger().warn('set_parameters call timed out')
             return None
-        reorient_deg = np.degrees(
-            Rotation.from_matrix(R_current.T @ R_target).magnitude())
+        return future.result().results[0]
+
+    def set_target_port(self, name):
+        result = self._set_remote_param('target_port', name)
+        if result is None:
+            return None
+        if not result.successful:
+            self.get_logger().warn(f"depth_pose_node rejected target_port='{name}': {result.reason}")
+            return False
+        # world_frame/object_pose is only published once depth_pose_node has
+        # a CONFIRMED reading for this port (see its own _publish) -- clear
+        # whatever pose is left from the previous port so a chained move
+        # right after this can't act on a stale, wrong-port position while
+        # this one is still settling.
+        self.latest_object_pose = None
+        self._current_target_port = name
+        self.get_logger().info(f"target_port -> '{name}', waiting for a confirmed pose...")
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
+            if self.latest_object_pose is not None:
+                self.get_logger().info(f"'{name}' confirmed ({time.time() - t0:.1f}s)")
+                return True
+            time.sleep(0.05)
+        self.get_logger().warn(f"'{name}' not confirmed within 5s -- not moving")
+        return False
+
+    def freeze(self, on):
+        # Pins depth_pose_node to a single camera frame (see its own
+        # 'freeze_frame' parameter) so every "port <name>"/xy/where/truth
+        # after this reads the SAME image over and over, instead of a fresh
+        # capture each time -- isolates frame-to-frame vision noise (and
+        # identification flipping between candidates) from every other error
+        # source: if per-hole error still varies while frozen, the camera/
+        # detector is not the cause.
+        result = self._set_remote_param('freeze_frame', on)
+        if result is None:
+            return None
+        if not result.successful:
+            self.get_logger().warn(f'depth_pose_node rejected freeze_frame={on}: {result.reason}')
+            return False
         self.get_logger().info(
-            f'ready pose: {height*100:.0f}cm above table (table_z={table_z:.3f}), '
-            f'flange levelled -> {[round(v, 4) for v in target]} '
-            f'(moving {abs(target[2]-self.current_positions[2])*100:.1f}cm in Z, '
-            f'reorienting {reorient_deg:.0f}deg)')
-        if not move:
-            self.get_logger().info('(dry run, not moving)')
-            return None
-        return self.send_request(target)
+            'frame FROZEN -- every port lookup from here reuses this one image'
+            if on else 'frame live again')
+        return True
 
-    def _port_geometry(self, port=None):
-        """Where the target opening sits in the object's own frame.
-
-        With one opening there is nothing to choose and the constants at the top
-        of this file apply. A multi-port panel keeps its table in
-        config/opening_reference.json, built from the CAD, and the port is picked
-        by name -- vision never has to tell a USB from an HDMI, which is the one
-        thing it would be unreliable at.
+    def _target_xyz(self):
+        """The current target's own world-frame position, with its
+        per-port Z bias subtracted (_z_bias_for -- see that and
+        Z_BIAS_M_USB12/_OTHER's own comment for how the axis and
+        direction were confirmed) and the flat Y bias subtracted (see
+        Y_BIAS_M's own comment). Shared by hover() and hover_at() so
+        the correction only lives in one place. -> (3,) or None.
         """
-        if port is None:
-            return (HOLE_CENTRE_IN_MESH, HOLE_LONG_AXIS_IN_MESH,
-                    'single opening', None)
-        table = self.port_table()
-        if not table:
-            self.get_logger().error('no port table loaded; run tools/build_reference.py')
-            return None
-        if port not in table:
-            self.get_logger().error(f'unknown port {port!r}; have {sorted(table)}')
-            return None
-        p = table[port]
-        # A port's polarity -- which end of its long axis the plug's latch has to
-        # meet. Note this is NOT detected from the camera: the value comes from
-        # config and is the same every frame. That is deliberate and sufficient,
-        # because the platform's own orientation is already settled outright by
-        # the port-pattern match, so a port's polarity relative to the platform
-        # is a fixed fact about the hardware rather than something to re-measure.
-        #
-        # An earlier version of this comment claimed the CAD models these
-        # cavities as plain symmetric slots. That was wrong -- measured by
-        # ray-casting server1_all.STL at 0.1mm, every cavity is strongly
-        # asymmetric under a half turn (USB 118%, RJ45 37%, HDMI 10% of cells
-        # unmatched), and the asymmetry runs across the *short* axis: USB is
-        # 0.5mm deeper on -x (the tongue sits on +x), RJ45 0.7mm deeper on +x
-        # (the latch slot). All eight ports agree in direction, none is mirrored,
-        # which is why flip=1 throughout is self-consistent. It does mean the
-        # polarity could be derived from the CAD instead of hardcoded, which
-        # would matter on a platform that mounts some ports turned around.
-        flip = int(p.get('flip', 1))
-        return (np.array(p['centre']), np.array(p['long_axis']) * flip,
-                f"{port} ({p['kind']}{', flipped' if flip < 0 else ''})",
-                p['kind'])
-
-    def roll_for_kind(self, kind):
-        """Automatic roll for this kind of plug, in degrees."""
-        name = f'roll_{kind}' if kind else 'roll_default'
-        try:
-            return float(self.get_parameter(name).value)
-        except Exception:
-            self.get_logger().warn(
-                f'no {name} parameter for a {kind!r} plug; using 0deg',
-                throttle_duration_sec=30)
-            return 0.0
-
-    def port_table(self):
-        """Named ports for the currently selected part, loaded once."""
-        if self._ports is not None:
-            return self._ports
-        path = os.path.join(get_package_share_directory('py_gripper'),
-                            'config', 'opening_reference.json')
-        try:
-            refs = json.load(open(path))
-        except OSError as e:
-            self.get_logger().error(f'cannot read {path}: {e}')
-            return {}
-        entry = refs.get(self.part, {})
-        self._ports = {p['name']: p for p in entry.get('ports', [])}
-        if self._ports:
-            self.get_logger().info(
-                f"loaded {len(self._ports)} ports for {self.part!r}: "
-                f"{', '.join(sorted(self._ports))}")
-        return self._ports
-
-    def _hole_frame(self, roll_deg=0.0, port=None):
-        # Shared geometry for the hole-aligned commands: where the socket
-        # opening is in world coords, which way it faces, and the flange
-        # rotation that squares the gripper up to it.
-        #
-        # roll_deg is the one thing that can't be derived from the mesh or the
-        # calibration: it depends on how the plug happens to sit in the gripper
-        # jaws. Try 0/90/180/270 and keep whichever makes the plug's rectangle
-        # line up with the socket's.
         if self.latest_object_pose is None:
-            self.get_logger().warn('no world_frame/object_pose received yet, cannot align to hole')
             return None
-
         p = self.latest_object_pose.pose.position
-        q = self.latest_object_pose.pose.orientation
-        R_world_obj = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
-        obj_pos = np.array([p.x, p.y, p.z])
+        z_bias = _z_bias_for(self._current_target_port)
+        return np.array([p.x, p.y - Y_BIAS_M, p.z - z_bias])
 
-        geom = self._port_geometry(port)
-        if geom is None:
-            return None
-        centre_in_mesh, long_in_mesh, label, kind = geom
-        hole_pos = obj_pos + R_world_obj @ centre_in_mesh
-        long_axis = R_world_obj @ long_in_mesh
+    def hover(self, move=True):
+        """Line up X/Y over the target, without following it along the
+        flange's own Z -- the panel's approach/normal axis on this
+        side-mounted setup. Keeps whatever standoff distance from the panel
+        the arm already has; only slides sideways. Orientation untouched.
 
-        # The jig always lies flat on the table with the socket facing
-        # straight up, so the true hole normal is exactly world +Z regardless
-        # of what FoundationPose's rotation estimate says -- trust that
-        # physical constraint instead of the tracked normal, which is both
-        # noisy and prone to a ~180deg ambiguity on this box shape (see
-        # track_publish_and_stream.py). The only thing that actually needs to
-        # come from tracking is the in-plane heading that squares the gripper
-        # to the hole's long edge.
-        normal = np.array([0.0, 0.0, 1.0])
-        flange_z = -normal                                   # face the hole, straight down
-
-        flange_x = long_axis.copy()
-        flange_x[2] = 0.0                                    # heading only -- ignore tilt/noise
-        n = np.linalg.norm(flange_x)
-        if n < 1e-6:
-            self.get_logger().error('degenerate hole heading (long axis reads as vertical), refusing to move')
-            return None
-        flange_x /= n
-        flange_y = np.cross(flange_z, flange_x)
-        R_world_flange = np.column_stack([flange_x, flange_y, flange_z])
-        auto_roll = self.roll_for_kind(kind)
-        roll_total = roll_deg + auto_roll
-        if auto_roll:
-            self.get_logger().info(
-                f'{kind} plug: adding {auto_roll:+.0f}deg automatic roll '
-                f'(total {roll_total:+.0f}deg)')
-        R_world_flange = R_world_flange @ Rotation.from_euler(
-            'z', roll_total, degrees=True).as_matrix()
-        return hole_pos, normal, R_world_flange
-
-    def _send_hole_target(self, target_pos, R_world_flange, label, move):
-        rx, ry, rz = Rotation.from_matrix(R_world_flange).as_euler('xyz')
-        target = [float(target_pos[0]), float(target_pos[1]), float(target_pos[2]),
-                  float(rx), float(ry), float(rz)]
-        if not self.target_is_sane(target):
-            return None
-        R_current = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()
-        reorient_deg = np.degrees(Rotation.from_matrix(R_current.T @ R_world_flange).magnitude())
-        self.get_logger().info(f'{label} -> {[round(v,4) for v in target]} '
-                               f'(reorienting {reorient_deg:.0f}deg)')
-        if not move:
-            self.get_logger().info('(dry run, not moving)')
-            return None
-        return self.send_request(target)
-
-    def align_to_hole(self, standoff=0.15, roll_deg=0.0, move=True, port=None):
-        # Park standoff metres straight out along the hole's normal, squared up
-        # to the socket. Unlike hover/align_xy this uses the object's
-        # orientation, so the wrist rotates instead of staying fixed downward.
-        f = self._hole_frame(roll_deg, port)
-        if f is None:
-            return None
-        hole_pos, normal, R_world_flange = f
-        return self._send_hole_target(
-            hole_pos + normal * standoff, R_world_flange,
-            f'align_to_hole [{port or "hole"}] standoff={standoff} roll={roll_deg}deg', move)
-
-    def align_hole_xy(self, roll_deg=0.0, move=True, port=None):
-        # Same squaring-up rotation as align_to_hole, but XY only: Z stays at
-        # whatever height the arm is already at, so orientation and XY can be
-        # dialled in without the tool ever creeping closer to the work.
-        f = self._hole_frame(roll_deg, port)
-        if f is None:
-            return None
-        hole_pos, _normal, R_world_flange = f
-        target_pos = np.array([hole_pos[0], hole_pos[1], self.current_positions[2]])
-        return self._send_hole_target(
-            target_pos, R_world_flange,
-            f'align_hole_xy [{port or "hole"}] (keeping current Z) roll={roll_deg}deg', move)
-
-    def align_xy(self):
-        # keep Z (and current height) exactly where the arm already is;
-        # only update X/Y to the latest detected object position. For
-        # iterating on XY alignment without the risk of Z creeping down
-        # on every retry.
-        if self.latest_object_pose is None:
+        A depth-safe first step: no risk from the depth measurement being
+        off, confirm visually, then close the remaining distance
+        deliberately with approach() or hover_at().
+        """
+        target_xyz = self._target_xyz()
+        if target_xyz is None:
             self.get_logger().warn('no world_frame/object_pose received yet, cannot align')
             return None
-        p = self.latest_object_pose.pose.position
-        target = [p.x, p.y, self.current_positions[2], 3.14159, 0.0, -1.57]
+        cur = np.array(self.current_positions[:3])
+        flange_z = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()[:, 2]
+        delta = target_xyz - cur
+        depth = float(np.dot(delta, flange_z))
+        delta_perp = delta - depth * flange_z
+        target = list(cur + delta_perp) + list(self.current_positions[3:6])
         if not self.target_is_sane(target):
             return None
-        self.get_logger().info(f'aligning XY only, keeping current Z: {target}')
+        dist = float(np.linalg.norm(delta_perp))
+        self.get_logger().info(
+            f'hovering over target, flange-Z depth held fixed (target is '
+            f'{depth*100:+.1f}cm away along that axis -- not followed) -> '
+            f'{[round(v, 4) for v in target]} ({dist*100:.1f}cm sideways move)')
+        if not move:
+            self.get_logger().info('(dry run, not moving)')
+            return None
         return self.send_request(target)
+
+    def hover_at(self, standoff_cm, tip_offset_cm=DEFAULT_TIP_OFFSET_CM, move=True):
+        """Go directly to standoff_cm before the target, along the flange's
+        own approach axis -- both X/Y and depth in one move, unlike hover()
+        (X/Y only, keeps whatever depth the arm already happens to be at).
+
+        Both X/Y and depth come from the target's own WORLD-frame position
+        (world_frame/object_pose -- hand-eye + tool_pose already applied),
+        the same one hover()/where() read, confirmed accurate live via the
+        roll()+where() hand-eye check (1.2mm drift over a 20deg turn).
+        tip_offset_cm is added directly onto standoff_cm in the retreat
+        distance, so the total distance held back from the target is
+        (standoff_cm + tip_offset_cm)/100 metres along flange Z.
+
+        tip_offset_cm MUST be measured from G -- the point tool_pose /
+        current_positions actually reports, i.e. wherever send_request()'s
+        target actually lands -- not the camera, and not assumed to be the
+        raw mechanical flange either. On this rig G sits 4.425cm further
+        out along Z than the flange itself (confirmed against the teach
+        pendant's own TCP setting); the two are not the same point, so a
+        distance measured from the flange face still needs that 4.425cm
+        subtracted before it is usable here. DEFAULT_TIP_OFFSET_CM was
+        measured directly from G with the connector already mounted,
+        sidestepping that arithmetic.
+
+        An earlier version of this method used a camera-frame depth
+        reading (camera_frame/object_pose) combined with a camera-to-
+        tool-tip ruler measurement, reasoning that camera_frame/object_pose
+        sidesteps the hand-eye chain entirely. That reasoning had a real
+        hole: the camera's own optical axis is NOT parallel to the
+        flange's Z axis -- computed from this rig's own T_G_C, they are
+        about 23 degrees apart -- so a distance measured along the
+        camera's axis cannot be applied as a move along the flange's axis
+        without introducing exactly that angular error. Confirmed live
+        2026-09-10: usb1 and usb3, dry-run from the same stationary pose
+        with tilt already within 2deg, reported depths 3.2cm apart -- far
+        more than 2deg of panel tilt could produce (well under 1mm over
+        this panel's own size), consistent with the computed 23deg
+        camera/flange offset instead. Measuring tip_offset_cm from G and
+        staying entirely in world frame avoids mixing the two axes at all.
+        """
+        target_xyz = self._target_xyz()
+        if target_xyz is None:
+            self.get_logger().warn('no world_frame/object_pose received yet, cannot align')
+            return None
+        flange_z = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()[:, 2]
+        total_standoff_m = (standoff_cm + tip_offset_cm) / 100.0
+        target = list(target_xyz - flange_z * total_standoff_m) + list(self.current_positions[3:6])
+        if not self.target_is_sane(target):
+            return None
+        dist = float(np.linalg.norm(np.array(target[:3]) - np.array(self.current_positions[:3])))
+        self.get_logger().info(
+            f'moving to {standoff_cm:.1f}cm + {tip_offset_cm:.1f}cm tip offset before '
+            f'target along the approach axis -> {[round(v, 4) for v in target]} '
+            f'({dist*100:.1f}cm from current)')
+        if not move:
+            self.get_logger().info('(dry run, not moving)')
+            return None
+        return self.send_request(target)
+
+    def approach(self, distance_cm, move=True):
+        """Slide the flange a given distance along its own +Z axis -- the
+        panel's approach/normal direction here, since the panel is
+        side-mounted and the flange faces it head-on. Positive moves further
+        the way the flange is already pointing; negative backs away.
+        Orientation untouched.
+        """
+        cur = np.array(self.current_positions[:3])
+        flange_z = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()[:, 2]
+        target = list(cur + flange_z * (distance_cm / 100.0)) + list(self.current_positions[3:6])
+        if not self.target_is_sane(target):
+            return None
+        self.get_logger().info(
+            f'moving {distance_cm:+.1f}cm along flange Z -> {[round(v, 4) for v in target]}')
+        if not move:
+            self.get_logger().info('(dry run, not moving)')
+            return None
+        return self.send_request(target)
+
+    def _wait_fresh_pose(self, timeout=5.0):
+        # depth_pose_node's panel-orientation smoother holds a short window
+        # of recent frames (median-filtered, see its own HoleSmoother) --
+        # right after ANY real motion (this file's own square/approach/
+        # hover/pos, or a manual jog), that window is still part pre-move,
+        # part post-move for a few frames, so a value read immediately after
+        # moving can describe where the camera *was* rather than where it
+        # is now. Clearing and waiting for a new publish (same trick
+        # set_target_port already uses when switching ports) means whatever
+        # gets read next reflects the camera's current pose.
+        self.latest_object_pose = None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.latest_object_pose is not None:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def check_tilt(self):
+        """How far the flange's own approach axis is from square to the
+        panel. world_frame/object_pose's orientation IS the panel's own
+        measured frame (mpl.panel_axes_pose: Y=long axis, X=short axis,
+        Z=depth-plane normal -- the same measurement drawn as the two arrows
+        in the debug view, not a separate/decorative thing), so this is a
+        real comparison against vision, not a guess.
+
+        0 deg means flange Z is exactly parallel (or exactly anti-parallel --
+        either is "square", direction is a sign convention this doesn't need
+        to resolve) to the panel's own measured normal.
+        """
+        if not self._wait_fresh_pose():
+            self.get_logger().warn('no fresh world_frame/object_pose within 5s, cannot check tilt')
+            return None
+        q = self.latest_object_pose.pose.orientation
+        panel_normal = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()[:, 2]
+        flange_z = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()[:, 2]
+        angle = float(np.degrees(np.arccos(np.clip(np.dot(flange_z, panel_normal), -1.0, 1.0))))
+        tilt = min(angle, 180.0 - angle)
+        self.get_logger().info(
+            f'flange approach axis is {tilt:.1f} deg off square to the panel '
+            f'(0 = perfectly parallel)')
+        return tilt
+
+    def where(self):
+        """The current target hole's world-frame position, plus how far it
+        has moved since the last call.
+
+        The hand-eye check: a hole that has not physically moved must report
+        the same world coordinates no matter where the arm looks at it from,
+        because T_world_arm is supposed to cancel the arm's own motion out
+        (world = T_world_arm (x) T_G_C (x) camera). Read it here, move the arm,
+        read it again -- whatever the number drifts by is hand-eye error (or a
+        tool_pose/TCP mismatch), not hole-measurement noise, since both
+        readings are of the same hole.
+
+        The arm's own reorientation between the two reads is reported
+        alongside, because the two numbers only mean something together: a
+        hand-eye error affects both readings almost identically when the
+        wrist has NOT turned, so it cancels in the difference and a pure
+        translation between reads can show ~0 drift however bad the
+        calibration is. Turning the wrist is what separates them.
+        """
+        if self.latest_object_pose is None:
+            self.get_logger().warn('no world_frame/object_pose received yet')
+            return None
+        p = self.latest_object_pose.pose.position
+        pos = np.array([p.x, p.y, p.z])
+        R_now = Rotation.from_euler('xyz', self.current_positions[3:6])
+        msg = f'target in world frame: {[round(v, 4) for v in pos]}'
+        prev = getattr(self, '_last_where', None)
+        if prev is not None:
+            prev_pos, prev_R = prev
+            d = pos - prev_pos
+            turned = float(np.degrees((prev_R.inv() * R_now).magnitude()))
+            msg += (f' | drifted {np.linalg.norm(d)*1000:.1f}mm '
+                    f'(dx {d[0]*1000:+.1f}, dy {d[1]*1000:+.1f}, dz {d[2]*1000:+.1f} mm) '
+                    f'while the wrist turned {turned:.1f} deg')
+            if turned < 10.0:
+                msg += ('  [wrist barely turned -- a hand-eye error largely '
+                        'cancels between two reads like this, so a small '
+                        'drift here does NOT clear the calibration]')
+        self._last_where = (pos, R_now)
+        self.get_logger().info(msg)
+        return pos
+
+    def square_up(self, move=True):
+        """Reorient the flange so its approach axis is exactly parallel to
+        the panel's own measured normal (see check_tilt) -- position
+        untouched, this only rotates in place.
+
+        Rather than jogging by hand toward 0 deg (imprecise, and 2 deg was
+        apparently the practical floor for that), this reads the same
+        vision-measured normal check_tilt compares against and solves for
+        the exact orientation directly -- limited by measurement noise, not
+        by how finely a human can jog.
+
+        Whatever heading (roll about the new approach axis) the flange
+        currently has is kept as close as possible rather than picked
+        arbitrarily, the same spirit as the old ready_pose's flange-levelling
+        -- this should not spin the tool around unnecessarily to get there.
+        """
+        if not self._wait_fresh_pose():
+            self.get_logger().warn('no fresh world_frame/object_pose within 5s, cannot square up')
+            return None
+        q = self.latest_object_pose.pose.orientation
+        panel_normal = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()[:, 2]
+        R_cur = Rotation.from_euler('xyz', self.current_positions[3:6]).as_matrix()
+        flange_z_cur, flange_x_cur = R_cur[:, 2], R_cur[:, 0]
+        # match whichever sign of the normal the flange is already closer to,
+        # so this does not flip the tool through 180 deg to "align" the other way
+        target_z = panel_normal if np.dot(panel_normal, flange_z_cur) > 0 else -panel_normal
+        x_proj = flange_x_cur - np.dot(flange_x_cur, target_z) * target_z
+        n = np.linalg.norm(x_proj)
+        if n < 1e-6:
+            # current X is now parallel to the new Z -- no heading to keep,
+            # any perpendicular direction will do
+            x_proj = R_cur[:, 1]
+            x_proj = x_proj - np.dot(x_proj, target_z) * target_z
+            n = np.linalg.norm(x_proj)
+        x_new = x_proj / n
+        y_new = np.cross(target_z, x_new)
+        rx, ry, rz = Rotation.from_matrix(
+            np.column_stack([x_new, y_new, target_z])).as_euler('xyz')
+        target = list(self.current_positions[:3]) + [float(rx), float(ry), float(rz)]
+        if not self.target_is_sane(target):
+            return None
+        reorient_deg = float(np.degrees(
+            Rotation.from_matrix(R_cur.T @ np.column_stack([x_new, y_new, target_z])).magnitude()))
+        self.get_logger().info(
+            f'squaring up to the panel -> {[round(v, 4) for v in target]} '
+            f'(reorienting {reorient_deg:.1f} deg, position unchanged)')
+        if not move:
+            self.get_logger().info('(dry run, not moving)')
+            return None
+        return self.send_request(target)
+
+    def roll(self, degrees, move=True):
+        """Turn the flange about its own approach axis, position unchanged.
+
+        The motion the hand-eye check in where() needs: the camera sits ~6cm
+        off this axis (T_G_C's own translation), so rolling about it swings
+        the camera around the target -- a genuinely different viewpoint AND a
+        genuinely different wrist orientation, while the target stays in
+        frame. Turning about a world axis instead would just aim the camera
+        off the panel.
+        """
+        R_cur = Rotation.from_euler('xyz', self.current_positions[3:6])
+        R_new = R_cur * Rotation.from_euler('z', degrees, degrees=True)
+        rx, ry, rz = R_new.as_euler('xyz')
+        target = list(self.current_positions[:3]) + [float(rx), float(ry), float(rz)]
+        if not self.target_is_sane(target):
+            return None
+        self.get_logger().info(
+            f'rolling {degrees:+.1f} deg about the approach axis, position held '
+            f'-> {[round(v, 4) for v in target]}')
+        if not move:
+            self.get_logger().info('(dry run, not moving)')
+            return None
+        return self.send_request(target)
+
+    def save_pose(self):
+        # A single remembered slot, not a named set -- the use case is one
+        # standard stance to return to (e.g. to measure every hole from a
+        # consistent distance/angle), not a library of poses.
+        self._saved_pose = list(self.current_positions)
+        try:
+            with open(SAVED_POSE_PATH, 'w') as f:
+                json.dump(self._saved_pose, f)
+        except OSError as e:
+            self.get_logger().warn(f'could not persist saved pose to {SAVED_POSE_PATH}: {e}')
+        self.get_logger().info(f'saved current pose -> {[round(v, 4) for v in self._saved_pose]}')
+
+    def restore_pose(self, move=True):
+        pose = getattr(self, '_saved_pose', None)
+        if pose is None and os.path.exists(SAVED_POSE_PATH):
+            with open(SAVED_POSE_PATH) as f:
+                pose = json.load(f)
+            self._saved_pose = pose
+        if pose is None:
+            self.get_logger().warn("no saved pose yet -- use 'save' first")
+            return None
+        if not self.target_is_sane(pose):
+            return None
+        dist = float(np.linalg.norm(np.array(pose[:3]) - np.array(self.current_positions[:3])))
+        self.get_logger().info(
+            f'restoring saved pose -> {[round(v, 4) for v in pose]} ({dist*100:.1f}cm from current)')
+        if not move:
+            self.get_logger().info('(dry run, not moving)')
+            return None
+        return self.send_request(pose)
 
     def is_arrived(self,error=0.01):
         if sum((self.target_positions[i]-self.current_positions[i])**2 for i in range(3)) > error**2:
@@ -395,11 +509,11 @@ class ArmCmd(Node):
         return True
 
     def wait_until_arrived(self, timeout=15.0, error=0.005):
-        # send_request() only dispatches the service call -- rclpy's
-        # Future.result() returns None rather than blocking when the call
-        # hasn't completed, so it returns as soon as the request is queued.
-        # That's fine when a human is pacing the commands, but chaining moves
-        # in code needs an explicit wait or every step fires at once.
+        # send_request() only dispatches the service call and returns as
+        # soon as the request is queued -- it does not wait for the arm to
+        # actually get there. That's fine when a human is pacing the
+        # commands, but chaining moves in code needs an explicit wait or
+        # every step fires at once.
         #
         # Polls current_positions, which the background spin thread keeps
         # updated. Deliberately does NOT call rclpy.spin_once(): that thread is
@@ -417,7 +531,16 @@ class ArmCmd(Node):
 
     def send_request(self,positions=[0.2, -0.4, 0.35, 3.14159, 0.0, -1.57],
                      velocity=0.1, acc_time=0.5, blend_percentage=100, fine_goal=False):
-        
+        """-> True once the move is dispatched -- NOT once the arm has
+        arrived, and not the service's own response either: the response
+        is handled by the background spin thread, arriving well after this
+        returns, so returning future.result() here gave back None on
+        essentially every call regardless of success (confirmed live:
+        code that branched on it, see arm_cmd_cycle.py, mistook every
+        single dispatched move for a failure). Callers that need to know
+        the move actually finished must follow this with
+        wait_until_arrived(), which is what that is for.
+        """
         self.target_positions = positions
         print(self.target_positions)
         set_positions_req = SetPositions.Request()
@@ -427,10 +550,9 @@ class ArmCmd(Node):
         set_positions_req.acc_time = acc_time
         set_positions_req.blend_percentage = blend_percentage
         set_positions_req.fine_goal = fine_goal
-        future = self.pos_cli.call_async(set_positions_req)
-        # rclpy.spin_until_future_complete(self, future)
-        return future.result()
-    
+        self.pos_cli.call_async(set_positions_req)
+        return True
+
     def send_gripper(self,gap=0.085):
         # Toyo CHG2: binary open/close via End Effector DO_0 (H=close, L=open).
         # Keeps the old continuous "gap" arg so existing call sites don't change;
@@ -457,59 +579,17 @@ class ArmCmd(Node):
         return future.result()
 
 
-def parse_hole_args(args):
-    """Arguments after hole/holexy -> (port name, roll degrees, dry run, standoff m).
-
-    A port name and a roll angle are both optional and tell themselves apart:
-    anything that parses as a number is the angle, anything else is a name. So
-    "holexy", "holexy 90", "holexy usb2" and "holexy usb2 90 dry" all read the
-    way they look.
-
-    Standoff is written with an explicit "cm" suffix ("hole usb2 3cm") rather
-    than as a second bare number, because a bare number is already spoken for
-    -- it is the roll angle -- and there is no position in the argument list
-    that would tell the two apart otherwise. Only "hole" uses it; "holexy"
-    keeps Z wherever the arm already is; standoff=None there.
-    """
-    port, roll, dry, standoff = None, 0.0, False, None
-    for a in args:
-        if a in ('dry', 'd'):
-            dry = True
-            continue
-        for suffix, scale in (('mm', 0.001), ('cm', 0.01)):
-            if a.endswith(suffix):
-                try:
-                    standoff = float(a[:-len(suffix)]) * scale
-                    break
-                except ValueError:
-                    pass
-        else:
-            suffix = None
-        if suffix is not None and a.endswith(suffix):
-            try:
-                float(a[:-len(suffix)])
-                continue
-            except ValueError:
-                pass
-        try:
-            roll = float(a)
-        except ValueError:
-            port = a
-    return port, roll, dry, standoff
-
-
 def main(args=None):
     rclpy.init(args=args)
     armCmd = ArmCmd()
     rclpy.spin_once(armCmd)
-    armCmd.send_gripper(0.085)
 
     # response = armCmd.send_request()
     # while not armCmd.is_arrived():
     #     rclpy.spin_once(armCmd)
     # print("move",armCmd.target_positions)
 
-    # response = armCmd.send_request([0.33, -0.47, 0.35, 3.14159, 0.0, -1.57])    
+    # response = armCmd.send_request([0.33, -0.47, 0.35, 3.14159, 0.0, -1.57])
     # while not armCmd.is_arrived():
     #     rclpy.spin_once(armCmd)
     # print("move",armCmd.target_positions)
@@ -518,11 +598,11 @@ def main(args=None):
     # while not armCmd.is_arrived():
     #     rclpy.spin_once(armCmd)
     # print("move",armCmd.target_positions)
-    
+
     # armCmd.send_gripper(0.03)
     # time.sleep(1.5)
     # print("pick")
-    
+
     # response = armCmd.send_request([0.33, -0.46, 0.35, 3.14159, 0.0, -1.57])
     # while not armCmd.is_arrived():
     #     rclpy.spin_once(armCmd)
@@ -581,7 +661,7 @@ def main(args=None):
     # while not armCmd.is_arrived():
     #     rclpy.spin_once(armCmd)
     # print("move",armCmd.target_positions)
-    
+
     # armCmd.send_gripper(0.085)
     # time.sleep(1.5)
     # print("place")
@@ -613,7 +693,7 @@ def main(args=None):
     # print("total_time %.3f" % total_time,"fragment_size %.3f" % fragment_size ,"duration %.3f" % duration)
     # last = time.time()
     # while True:
-        
+
     #     if p > distance:
     #         break
     #     rclpy.spin_once(armCmd)
@@ -628,7 +708,7 @@ def main(args=None):
 
     #     while (time.time() - last) < (1/HZ):
     #         rclpy.spin_once(armCmd)
-            
+
     #     print(1/(time.time() - last))
     #     last = time.time()
     # subscriptions/service futures need the node spinning to actually receive
@@ -639,33 +719,91 @@ def main(args=None):
 
     while True:
         raw = input("Positions: ").strip()
-        # "h" / "h 10cm" / "h 10cm dry" -- straight down, pose untouched.
-        if raw.split() and raw.split()[0] in ('h', 'hover'):
-            _p, _roll, dry, drop = parse_hole_args(raw.split()[1:])
-            kwargs = {} if drop is None else {'drop': drop}
-            armCmd.descend(move=not dry, **kwargs)
+        # "xy [name] [dry]" -- optionally switch target_port first, then
+        # line up X/Y over it without following it along the flange's own Z
+        # (the panel's approach axis). Was "hover".
+        if raw.split() and raw.split()[0] == 'xy':
+            parts = raw.split()[1:]
+            dry = 'dry' in parts
+            names = [x for x in parts if x != 'dry']
+            if len(names) > 1:
+                armCmd.get_logger().warn('usage: xy [name] [dry], e.g. xy usb6')
+            elif not names or armCmd.set_target_port(names[0]):
+                armCmd.hover(move=not dry)
             continue
-        if raw in ('xy', 'align'):
-            armCmd.align_xy()
+        # "z <cm>" / "z <cm> dry" -- slide that many cm along the flange's
+        # own +Z (toward the panel here); negative backs away. Was "approach".
+        if raw.split() and raw.split()[0] == 'z':
+            parts = raw.split()
+            dry = 'dry' in parts[1:]
+            nums = [x for x in parts[1:] if x != 'dry']
+            if len(nums) != 1:
+                armCmd.get_logger().warn('usage: z <cm> [dry], e.g. z 3')
+            else:
+                armCmd.approach(float(nums[0]), move=not dry)
             continue
-        # "ready" / "ready 30cm" / "ready dry" -- starting pose for a run:
-        # a set height above the table with the flange face levelled.
-        if raw.split() and raw.split()[0] in ('ready', 'rdy'):
-            _p, _roll, dry, height = parse_hole_args(raw.split()[1:])
-            kwargs = {} if height is None else {'height': height}
-            armCmd.ready_pose(move=not dry, **kwargs)
+        # "above <cm> [tip_cm] [name] [dry]" -- go directly to <cm> before
+        # the target (optionally switching target_port first), X/Y and
+        # depth together. tip_cm defaults to DEFAULT_TIP_OFFSET_CM (the
+        # G-to-tool-tip distance, ruler-measured -- see hover_at's own
+        # docstring for why it must be measured from G, not the flange
+        # face and not the camera) and only needs typing to override it
+        # for one call.
+        if raw.split() and raw.split()[0] == 'above':
+            parts = raw.split()[1:]
+            dry = 'dry' in parts
+            rest = [x for x in parts if x != 'dry']
+            nums = [x for x in rest if x.replace('.', '', 1).replace('-', '', 1).isdigit()]
+            names = [x for x in rest if x not in nums]
+            if len(nums) not in (1, 2) or len(names) > 1:
+                armCmd.get_logger().warn(
+                    f'usage: above <cm> [tip_cm] [name] [dry], e.g. above 0.5 usb6 '
+                    f'(tip_cm defaults to {DEFAULT_TIP_OFFSET_CM})')
+            elif not names or armCmd.set_target_port(names[0]):
+                tip_cm = float(nums[1]) if len(nums) == 2 else DEFAULT_TIP_OFFSET_CM
+                armCmd.hover_at(float(nums[0]), tip_cm, move=not dry)
             continue
-        # "hole" / "hole 90" / "hole 90 dry"  -- roll angle in degrees, plus an
-        # optional dry run that prints the computed target without moving.
-        if raw.split() and raw.split()[0] in ('hole', 'a'):
-            port, roll, dry, standoff = parse_hole_args(raw.split()[1:])
-            kwargs = {} if standoff is None else {'standoff': standoff}
-            armCmd.align_to_hole(roll_deg=roll, move=not dry, port=port, **kwargs)
+        # "save" -- remember the current pose. "back" / "back dry" -- return
+        # to it. One slot, persisted across restarts.
+        if raw.split() and raw.split()[0] in ('save', 'mark'):
+            armCmd.save_pose()
             continue
-        # "holexy" / "holexy 90" / "holexy 90 dry" -- same alignment, Z untouched
-        if raw.split() and raw.split()[0] in ('holexy', 'hxy'):
-            port, roll, dry, _standoff = parse_hole_args(raw.split()[1:])
-            armCmd.align_hole_xy(roll_deg=roll, move=not dry, port=port)
+        if raw.split() and raw.split()[0] in ('back', 'restore'):
+            dry = 'dry' in raw.split()[1:]
+            armCmd.restore_pose(move=not dry)
+            continue
+        # "save0" -- freeze depth_pose_node on the current camera frame, so
+        # every port lookup until "end0" reuses that one image.
+        if raw.strip() == 'save0':
+            armCmd.freeze(True)
+            continue
+        if raw.strip() == 'end0':
+            armCmd.freeze(False)
+            continue
+        # "t" -- how far off square the flange currently is to the panel.
+        # Was "tilt".
+        if raw.strip() == 't':
+            armCmd.check_tilt()
+            continue
+        # "roll <deg>" -- turn about the approach axis in place (the motion
+        # the "where" hand-eye check needs).
+        if raw.split() and raw.split()[0] == 'roll':
+            parts = raw.split()
+            dry = 'dry' in parts[1:]
+            nums = [x for x in parts[1:] if x != 'dry']
+            if len(nums) != 1:
+                armCmd.get_logger().warn('usage: roll <deg> [dry], e.g. roll 30')
+            else:
+                armCmd.roll(float(nums[0]), move=not dry)
+            continue
+        # "where" -- current target's world position + drift since last read.
+        if raw.strip() == 'where':
+            armCmd.where()
+            continue
+        # "s" / "s dry" -- rotate in place to exactly 0 deg tilt. Was "square".
+        if raw.split() and raw.split()[0] == 's':
+            dry = 'dry' in raw.split()[1:]
+            armCmd.square_up(move=not dry)
             continue
         positions = list(map(float, raw.split()))
         if len(positions) == 3:

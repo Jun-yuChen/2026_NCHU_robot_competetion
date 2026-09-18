@@ -33,7 +33,7 @@ from tm_msgs.msg import FeedbackState
 HOST = '127.0.0.1'
 PORT = 9999
 
-CALIB_PATH = os.path.join(get_package_share_directory('py_gripper'), 'calibration', 'ICA_Lab_UMI_Config_0804_1.yaml')
+CALIB_PATH = os.path.join(get_package_share_directory('py_gripper'), 'calibration', 'ICA_Lab_UMI_Config.yaml')
 
 
 def load_T_G_C():

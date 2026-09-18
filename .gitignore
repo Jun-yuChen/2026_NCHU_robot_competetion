@@ -26,3 +26,9 @@ ros2_ws/src/tm2_ros2/**
 !ros2_ws/src/realsense-ros/.gitkeep
 !ros2_ws/src/tm2_ros2/.gitkeep
 
+# Ignore these files
+*.csv
+ros2_ws/0
+ros2_ws/*.yaml
+ros2_ws/*.pkl
+

@@ -2,7 +2,9 @@
 # A service (not a topic) so the generator's client naturally blocks on
 # discovery until the control node's server is up -- no more silently
 # dropped points from publishing before the subscriber has matched.
+
 std_msgs/Header header
+string client_id "none"
 
 uint32 tick
 bool is_last
@@ -29,6 +31,7 @@ float64 point_time_s
 # Response: control -> generator
 int32 ROBOT_OK=0
 int32 ROBOT_ERROR=1
+int32 ROBOT_BUSY=3
 
 int32 result
 string message

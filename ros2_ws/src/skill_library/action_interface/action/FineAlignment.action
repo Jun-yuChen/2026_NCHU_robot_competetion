@@ -1,0 +1,32 @@
+# Request
+
+---
+# Result
+uint8 SUCCESS=0
+uint8 FAILURE=1
+uint8 CANCELLED=2
+uint8 TIMEOUT=3
+uint8 ERROR=4
+
+uint8 status
+string message
+float64 x_m
+float64 y_m
+float64 z_m
+float64 rx_deg
+float64 ry_deg
+float64 rz_deg
+bool pose_valid
+---
+# Feedback
+uint8 INITIALIZING=0
+uint8 WAITING_TOUCH=1
+uint8 PANEL_TOUCHING = 2
+uint8 SEARCHING=3
+uint8 HOLE_TESTING=4
+uint8 INSERTING=5
+uint8 COMPLETED=6
+
+uint8 state
+string message
+float32 progress

@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'optoforce_node = optoforce_driver.optoforce_node:main',
+            'zero_test = optoforce_driver.zero_test:main'
         ],
     },
 )
